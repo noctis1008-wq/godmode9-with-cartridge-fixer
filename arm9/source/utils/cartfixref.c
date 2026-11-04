@@ -29,6 +29,7 @@
 #define REF_LOG_TABLE_SIZE  STD_BUFFER_SIZE      // per-sector table (rebuilt on every save)
 #define REF_LOG_MAX_LINES   20000
 #define REF_COUNTDOWN_SEC   10
+#define REF_SHUTDOWN_SEC    30                   // power off this long after everything is fixed
 #define REF_HISTORY         10                   // rounds shown in the "fixed per round" rows
 #define REF_CFG_PATH        OUTPUT_PATH "/reffix.cfg"
 #define REF_HASH_SECTORS    0x800u               // sectors hashed per read when creating a .crh
@@ -211,10 +212,10 @@ static void io_end_pass(void* vctx, const CartRefStatus* st) {
     log_save(ctx);
 }
 
-// Wait REF_COUNTDOWN_SEC seconds. Returns false if the user cancelled with B.
-static bool countdown(const char* msg, const char* what) {
-    for (u32 t = REF_COUNTDOWN_SEC; t > 0; t--) {
-        ShowString("%s\n \n%s starts in %lu s.\n \n(A) start now   (B) cancel", msg, what, t);
+// Wait `secs` seconds. Returns false if the user cancelled with B.
+static bool countdown_secs(const char* msg, const char* what, u32 secs) {
+    for (u32 t = secs; t > 0; t--) {
+        ShowString("%s\n \n%s in %lu s.\n \n(A) now   (B) cancel", msg, what, t);
         u64 t0 = timer_start();
         while (timer_msec(t0) < 1000) {
             if (CheckButton(BUTTON_A)) return true;
@@ -249,6 +250,12 @@ static bool choose_autoretry(bool* autoretry) {
     *autoretry = (sel == 1);
     if (*autoretry != last) save_autoretry(*autoretry);
     return true;
+}
+
+static bool countdown(const char* msg, const char* what) {
+    char w[48];
+    snprintf(w, sizeof(w), "%s starts", what);
+    return countdown_secs(msg, w, REF_COUNTDOWN_SEC);
 }
 
 static int io_cart_read(void* vctx, u32 sector, u32 count, void* buf, bool refresh) {
@@ -857,6 +864,20 @@ u32 FixCartWithReference(const char* cart_path) {
     if (st.pending || st.unfixable || st.skipped) {
         log_printf(&ctx, "unresolved by region:\n");
         log_distribution(&ctx, &list, true);
+    }
+    // everything fixed: nothing left to retry, power off after a countdown
+    if ((res == CARTREF_OK) && !st.pending && !st.unfixable && !st.skipped) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "All %lu sectors fixed.\nRun Verify after the restart.", st.fixed);
+        log_printf(&ctx, "all sectors fixed, power off countdown\n");
+        log_save(&ctx);
+        if (countdown_secs(msg, "Power off", REF_SHUTDOWN_SEC)) {
+            ref_close(ref);
+            DeinitExtFS();
+            DeinitSDCardFS();
+            PowerOff();
+        }
+        log_printf(&ctx, "power off cancelled by user\n");
     }
     log_save(&ctx);
 
