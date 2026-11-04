@@ -1519,6 +1519,7 @@ u32 FileHandlerMenu(char* current_path, u32* cursor, u32* scroll, PaneData** pan
     int mount = (mountable) ? ++n_opt : -1;
     int corruptfix = (mountable && (filetype & GAME_NCSD)) ? ++n_opt : -1;
     int reffix = (mountable && (filetype & GAME_NCSD) && ((file_path[0] == 'C') || (file_path[0] == 'c')) && (file_path[1] == ':')) ? ++n_opt : -1;
+    int refhash = (reffix > 0) ? ++n_opt : -1;
     int restore = (restorable) ? ++n_opt : -1;
     int ebackup = (ebackupable) ? ++n_opt : -1;
     int ncsdfix = (ncsdfixable) ? ++n_opt : -1;
@@ -1558,6 +1559,7 @@ u32 FileHandlerMenu(char* current_path, u32* cursor, u32* scroll, PaneData** pan
     if (mount > 0) optionstr[mount-1] = (filetype & GAME_TMD) ? STR_MOUNT_CXI_NDS_TO_DRIVE : STR_MOUNT_IMAGE_TO_DRIVE;
     if (corruptfix > 0) optionstr[corruptfix-1] = "Fix cartridge corruption";
     if (reffix > 0) optionstr[reffix-1] = "Fix with reference image";
+    if (refhash > 0) optionstr[refhash-1] = "Create reference hash (.crh)";
     if (restore > 0) optionstr[restore-1] = STR_RESTORE_SYSNAND_SAFE;
     if (ebackup > 0) optionstr[ebackup-1] = STR_UPDATE_EMBEDDED_BACKUP;
     if (ncsdfix > 0) optionstr[ncsdfix-1] = STR_REBUILD_NCSD_HEADER;
@@ -1631,6 +1633,10 @@ u32 FileHandlerMenu(char* current_path, u32* cursor, u32* scroll, PaneData** pan
                 *scroll = 0;
             }
         }
+        return 0;
+    }
+    else if (user_select == refhash) {
+        CreateCartRefHash(file_path);
         return 0;
     }
     else if (user_select == reffix) {

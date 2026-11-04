@@ -54,6 +54,20 @@ void CartRef_Count(const CartRefList* l, CartRefStatus* st) {
     }
 }
 
+uint32_t CartRef_ResetUnresolved(CartRefList* l) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < l->count; i++) {
+        CartRefSector* e = &l->s[i];
+        if ((e->state != CARTREF_UNFIXABLE) && (e->state != CARTREF_SKIPPED)) continue;
+        uint32_t sector = e->sector;
+        memset(e, 0, sizeof(*e));
+        e->sector = sector;
+        e->state = CARTREF_PENDING;
+        n++;
+    }
+    return n;
+}
+
 static uint32_t sector_sum(const uint8_t* b) {
     uint32_t h = 2166136261u; // FNV-1a
     for (uint32_t i = 0; i < CARTREF_SECTOR; i++) {

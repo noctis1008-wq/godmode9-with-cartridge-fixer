@@ -137,9 +137,12 @@ If you have a **verified .3ds of the same game and version** (it does not have t
 4. Optionally verify the reference first (recommended).
 5. The cartridge is compared with the reference sector by sector (0x200 bytes). Only the sectors that differ are re-read with the refresh command, round-robin, until each one reads correctly 5 times in a row without refresh.
 
+**Making a reference from a healthy cartridge:** insert a good cartridge of the same game, press A on its `.3ds` in `[C:] GAMECART` and choose **Create reference hash (.crh)**. It is written to `SD:/luma/payloads/hash/<product code>_<title id>.crh`. Hashes made this way are of the encrypted cartridge data, so no decryption is needed when fixing (the fastest option).
+
 Why it is faster: the classic fixer can only check data against the game's own hashes, and some areas (ExeFS files such as `code.bin`) have one hash for several MB, so the whole area is re-read on every attempt. With a reference, only the damaged sectors are touched.
 
 - After the scan, the repair starts automatically after 10 seconds (A: start now, B: cancel).
+- **Auto retry** (chosen before each run, remembered): when a round ends with sectors still unfixable or skipped, they are reset and a new round starts automatically after 10 seconds.
 - The screen shows a rough estimate of the time left, based on how fast sectors have been resolved so far.
 - **B** pauses. Progress is saved to `SD:/gm9/out/cartref_<titleid>.dat` after every pass; run the option again to resume.
 - A detailed log (settings, scan speed, where the bad sectors are, a summary per pass, the result per sector) is written to `SD:/luma/payloads/log/` and updated after every pass.

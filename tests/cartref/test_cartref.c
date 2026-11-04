@@ -129,6 +129,15 @@ static void test_scan_and_repair(void) {
     // RECOVER needing 40 refreshes: fixed after ~40 attempts across passes
     CHECK(find(&l, 2047)->attempts >= 40 && find(&l, 2047)->attempts <= 41);
     CHECK(end_passes == m->passes);
+    // another round: unresolved sectors go back to PENDING with fresh counters
+    CHECK(CartRef_ResetUnresolved(&l) == 2);
+    CHECK(find(&l, 3000)->state == CARTREF_PENDING && find(&l, 3000)->attempts == 0 && find(&l, 3000)->stuck == 0);
+    CHECK(find(&l, 4000)->state == CARTREF_PENDING);
+    CHECK(find(&l, 100)->state == CARTREF_FIXED);
+    m->fault[3000] = OK; // e.g. the controller finally restored it
+    CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
+    CHECK(find(&l, 3000)->state == CARTREF_FIXED);
+    CHECK(find(&l, 4000)->state == CARTREF_SKIPPED);
     printf("scan+repair: reads=%u refreshes=%u passes=%u\n", m->reads, m->refreshes, m->passes);
 
     free(buf);

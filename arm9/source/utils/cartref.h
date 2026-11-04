@@ -104,6 +104,9 @@ bool CartRef_ListInit(CartRefList* l, uint32_t capacity);
 void CartRef_ListFree(CartRefList* l);
 bool CartRef_ListAdd(CartRefList* l, uint32_t sector);
 void CartRef_Count(const CartRefList* l, CartRefStatus* st);
+// Put every UNFIXABLE / SKIPPED sector back to PENDING with fresh counters
+// (for another repair round). Returns how many were reset.
+uint32_t CartRef_ResetUnresolved(CartRefList* l);
 
 // Compare the given ranges of cartridge and reference, adding every differing
 // sector to `list`. `buf` must hold CARTREF_SCAN_CHUNK sectors plus

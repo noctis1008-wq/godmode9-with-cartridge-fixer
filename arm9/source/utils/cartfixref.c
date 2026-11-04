@@ -29,6 +29,8 @@
 #define REF_LOG_TABLE_SIZE  STD_BUFFER_SIZE      // per-sector table (rebuilt on every save)
 #define REF_LOG_MAX_LINES   20000
 #define REF_COUNTDOWN_SEC   10
+#define REF_CFG_PATH        OUTPUT_PATH "/reffix.cfg"
+#define REF_HASH_SECTORS    0x800u               // sectors hashed per read when creating a .crh
 
 extern bool force_refresh;                       // command_ctr.c: refresh before every read
 u32 LoadNcsdHeader(NcsdHeader* ncsd, const char* path); // gameutil.c
@@ -74,6 +76,7 @@ typedef struct {
     const char* state_file;
     u64 pass_timer;
     u64 attempts_before_pass;
+    u32 round;                // repair round (auto retry)
     u64 status_timer;
     u64 run_timer;
 } RefCtx;
@@ -194,8 +197,8 @@ static bool save_state(RefCtx* ctx) {
 static void io_end_pass(void* vctx, const CartRefStatus* st) {
     RefCtx* ctx = (RefCtx*) vctx;
     log_time(ctx);
-    log_printf(ctx, "pass %lu done in %llu s: remaining %lu, fixed %lu, unfixable %lu, skipped %lu, refresh reads %llu (total %llu)\n",
-        st->pass, (unsigned long long) timer_sec(ctx->pass_timer), st->pending, st->fixed, st->unfixable, st->skipped,
+    log_printf(ctx, "round %lu pass %lu done in %llu s: remaining %lu, fixed %lu, unfixable %lu, skipped %lu, refresh reads %llu (total %llu)\n",
+        ctx->round, st->pass, (unsigned long long) timer_sec(ctx->pass_timer), st->pending, st->fixed, st->unfixable, st->skipped,
         (unsigned long long) (st->total_attempts - ctx->attempts_before_pass), (unsigned long long) st->total_attempts);
     ctx->attempts_before_pass = st->total_attempts;
     ctx->pass_timer = timer_start();
@@ -205,15 +208,42 @@ static void io_end_pass(void* vctx, const CartRefStatus* st) {
 }
 
 // Wait REF_COUNTDOWN_SEC seconds. Returns false if the user cancelled with B.
-static bool countdown(const char* msg) {
+static bool countdown(const char* msg, const char* what) {
     for (u32 t = REF_COUNTDOWN_SEC; t > 0; t--) {
-        ShowString("%s\n \nRepair starts in %lu s.\n \n(A) start now   (B) cancel", msg, t);
+        ShowString("%s\n \n%s starts in %lu s.\n \n(A) start now   (B) cancel", msg, what, t);
         u64 t0 = timer_start();
         while (timer_msec(t0) < 1000) {
             if (CheckButton(BUTTON_A)) return true;
             if (CheckButton(BUTTON_B)) return false;
         }
     }
+    return true;
+}
+
+static bool load_autoretry(void) {
+    char buf[32] = { 0 };
+    size_t n = FileGetData(REF_CFG_PATH, buf, sizeof(buf) - 1, 0);
+    if (!n) return true; // default: on
+    return strstr(buf, "autoretry=0") == NULL;
+}
+
+static void save_autoretry(bool on) {
+    const char* txt = on ? "autoretry=1\n" : "autoretry=0\n";
+    fvx_rmkdir(OUTPUT_PATH);
+    FileSetData(REF_CFG_PATH, txt, strlen(txt), 0, true);
+}
+
+// Ask for the auto retry setting (remembered). Returns false if cancelled.
+static bool choose_autoretry(bool* autoretry) {
+    bool last = load_autoretry();
+    const char* opts[2];
+    opts[0] = last ? "Auto retry: ON (last used)" : "Auto retry: ON";
+    opts[1] = last ? "Auto retry: OFF" : "Auto retry: OFF (last used)";
+    u32 sel = ShowSelectPrompt(2, opts,
+        "Auto retry\n \nWhen a round ends with sectors still\nnot fixed, start another round\nautomatically after %d s?", REF_COUNTDOWN_SEC);
+    if (!sel) return false;
+    *autoretry = (sel == 1);
+    if (*autoretry != last) save_autoretry(*autoretry);
     return true;
 }
 
@@ -400,7 +430,7 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     u64 sec = timer_sec(ctx->run_timer);
 
     DrawString(MAIN_SCREEN, "Fix with reference image", x, y, COLOR_STD_FONT, COLOR_STD_BG); y += 2 * lh;
-    snprintf(line, sizeof(line), "Pass %-8lu   Time %02lu:%02lu:%02lu        ", (unsigned long) st->pass,
+    snprintf(line, sizeof(line), "Round %-3lu Pass %-6lu Time %02lu:%02lu:%02lu   ", (unsigned long) ctx->round, (unsigned long) st->pass,
         (unsigned long) (sec / 3600), (unsigned long) ((sec / 60) % 60), (unsigned long) (sec % 60));
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
     snprintf(line, sizeof(line), "Remaining  %-10lu              ", (unsigned long) st->pending);
@@ -594,6 +624,9 @@ u32 FixCartWithReference(const char* cart_path) {
         }
     }
 
+    bool autoretry = true;
+    if (!choose_autoretry(&autoretry)) goto done;
+
     FixerSim_LoadConfig();
     {
         const char* simstatus = FixerSim_Status();
@@ -644,6 +677,7 @@ u32 FixCartWithReference(const char* cart_path) {
         log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5\n",
             fixer_cfg.stuck_limit, fixer_cfg.retries_before_skip, fixer_cfg.autoskip ? 1 : 0);
         if (*FixerSim_Status()) log_printf(&ctx, "SIM BUILD: %s\n", FixerSim_Status());
+        log_printf(&ctx, "auto retry: %s\n", autoretry ? "on" : "off");
         log_printf(&ctx, "%s\n", resumed ? "resumed from saved progress" : "new scan");
     }
     ctx.list = &list;
@@ -702,7 +736,7 @@ u32 FixCartWithReference(const char* cart_path) {
                     (unsigned long) REF_LIST_CAPACITY, (unsigned long) REF_LIST_CAPACITY);
             else snprintf(msg, sizeof(msg), "%lu bad sectors found (%lu KB).", list.count, list.count / 2);
             save_state(&ctx); // the scan result survives even if the repair never starts
-            if (!countdown(msg)) {
+            if (!countdown(msg, "Repair")) {
                 res = CARTREF_ABORTED;
                 log_printf(&ctx, "repair cancelled at the countdown\n");
             }
@@ -719,12 +753,37 @@ u32 FixCartWithReference(const char* cart_path) {
 
         ClearScreenF(true, false, COLOR_STD_BG);
         CTR_ResetRefreshCount();
-        log_time(&ctx);
-        log_printf(&ctx, "repair start: %lu sectors\n", list.count);
-        ctx.run_timer = ctx.pass_timer = timer_start();
-        ctx.attempts_before_pass = 0;
-        res = CartRef_Repair(&io, &params, &list);
-        ClearScreenF(true, false, COLOR_STD_BG);
+        u64 total_timer = timer_start();
+        for (ctx.round = 1;; ctx.round++) {
+            CartRefStatus rs;
+            CartRef_Count(&list, &rs);
+            log_time(&ctx);
+            log_printf(&ctx, "round %lu start: %lu sectors to work on\n", ctx.round, rs.pending);
+            ctx.run_timer = ctx.pass_timer = timer_start();
+            ctx.attempts_before_pass = 0;
+            ClearScreenF(true, false, COLOR_STD_BG);
+            res = CartRef_Repair(&io, &params, &list);
+            ClearScreenF(true, false, COLOR_STD_BG);
+
+            CartRef_Count(&list, &rs);
+            log_time(&ctx);
+            log_printf(&ctx, "round %lu end: result %d, fixed %lu, unfixable %lu, skipped %lu, remaining %lu (%llu s)\n",
+                ctx.round, (int) res, rs.fixed, rs.unfixable, rs.skipped, rs.pending,
+                (unsigned long long) timer_sec(ctx.run_timer));
+            if ((res != CARTREF_OK) || !autoretry || !(rs.unfixable + rs.skipped)) break;
+
+            save_state(&ctx);
+            log_save(&ctx);
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Round %lu finished.\n \nFixed: %lu\nNot fixed yet: %lu", ctx.round,
+                rs.fixed, rs.unfixable + rs.skipped);
+            if (!countdown(msg, "Next round")) {
+                log_printf(&ctx, "auto retry cancelled by user\n");
+                break;
+            }
+            CartRef_ResetUnresolved(&list);
+        }
+        ctx.run_timer = total_timer; // the final summary reports the total time
     }
 
     fvx_close(&ctx.cart);
@@ -767,4 +826,132 @@ done:
     if (list.s) CartRef_ListFree(&list);
     ref_close(ref);
     return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Create a .crh reference hash file from a known-good cartridge.
+// The hashes are of the raw (encrypted) cartridge data, so a cartridge fixed
+// with it is compared directly, without any decryption step.
+
+u32 CreateCartRefHash(const char* cart_path) {
+    char pathstr[UTF_BUFFER_BYTESIZE(32)];
+    TruncateString(pathstr, cart_path, 32, 8);
+
+    if (!is_gamecart_path(cart_path)) {
+        ShowPrompt(false, "%s\nThis only works on the cartridge\nitself ([C:] GAMECART).", pathstr);
+        return 1;
+    }
+
+    NcsdHeader ncsd;
+    if (LoadNcsdHeader(&ncsd, cart_path) != 0) {
+        ShowPrompt(false, "%s\nCannot read the cartridge header.", pathstr);
+        return 1;
+    }
+    u64 cart_size = fvx_qsize(cart_path);
+    u64 image_size = GetNcsdTrimmedSize(&ncsd); // padding after the last partition is not needed
+    if (!image_size || (image_size > cart_size)) image_size = cart_size;
+    image_size &= ~((u64) CARTREF_SECTOR - 1);
+
+    // per-partition NCCH headers
+    u8* head = (u8*) malloc(CRH_TABLE_OFFSET);
+    if (!head) return 1;
+    memset(head, 0, CRH_TABLE_OFFSET);
+    memcpy(head + CRH_NCSD_OFFSET, &ncsd, sizeof(NcsdHeader));
+    char product[0x11] = { 0 };
+    for (u32 i = 0; i < 8; i++) {
+        NcchPartition* p = ncsd.partitions + i;
+        if (!p->size) continue;
+        u8* h = head + CRH_NCCH_OFFSET + i * 0x200;
+        if ((FileGetData(cart_path, h, 0x200, (u64) p->offset * NCSD_MEDIA_UNIT) != 0x200) ||
+            (memcmp(h + 0x100, "NCCH", 4) != 0)) {
+            ShowPrompt(false, "%s\nContent%lu has no valid NCCH header.\nIs this cartridge really healthy?", pathstr, i);
+            free(head);
+            return 1;
+        }
+        if (i == 0) memcpy(product, ((NcchHeader*) (void*) h)->productcode, 0x10);
+    }
+    // ExeFS headers stay zero: the hashes are of encrypted data, no decryption needed
+
+    for (char* c = product; *c; c++) // keep the file name FAT-safe
+        if (!isalnum((unsigned char) *c) && (*c != '-') && (*c != '_')) *c = '_';
+    char out_path[128];
+    snprintf(out_path, sizeof(out_path), "%s/%s_%016llX.crh", REF_HASH_DIR, *product ? product : "CART",
+        (unsigned long long) ncsd.mediaId);
+
+    if (!ShowPrompt(true, "%s\nCreate a reference hash file\nfrom this cartridge?\n \nOutput:\n%s\n(%llu MB of cartridge data)\n \nOnly do this with a HEALTHY cartridge.",
+            pathstr, out_path, (unsigned long long) (image_size >> 20))) {
+        free(head);
+        return 1;
+    }
+    if (ShowPrompt(true, "Verify the cartridge first?\n(recommended: bad data would make\na bad reference)")) {
+        if (VerifyGameFile(cart_path, false) != 0) {
+            ShowPrompt(false, "%s\nCartridge failed verification.\nIt cannot be used as a reference.", pathstr);
+            free(head);
+            return 1;
+        }
+    }
+
+    CrhHeader* crh = (CrhHeader*) (void*) head;
+    memcpy(crh->magic, CRH_MAGIC, 4);
+    crh->version = CRH_VERSION;
+    crh->hash_size = CRH_HASH_SIZE;
+    crh->table_offset = CRH_TABLE_OFFSET;
+    crh->title_id = ncsd.mediaId;
+    crh->image_size = image_size;
+    crh->sector_count = (u32) (image_size / CARTREF_SECTOR);
+
+    u8* buf = (u8*) malloc((size_t) REF_HASH_SECTORS * CARTREF_SECTOR);
+    u8* hashes = (u8*) malloc((size_t) REF_HASH_SECTORS * CRH_HASH_SIZE);
+    FIL cart, out;
+    bool cart_open = false, out_open = false, ok = false;
+    if (!buf || !hashes) goto fail;
+    if (fvx_open(&cart, cart_path, FA_READ | FA_OPEN_EXISTING) != FR_OK) goto fail;
+    cart_open = true;
+    fvx_rmkdir(REF_HASH_DIR);
+    if (fvx_open(&out, out_path, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
+        ShowPrompt(false, "Cannot create\n%s", out_path);
+        goto fail;
+    }
+    out_open = true;
+
+    UINT bw = 0;
+    if ((fvx_write(&out, head, CRH_TABLE_OFFSET, &bw) != FR_OK) || (bw != CRH_TABLE_OFFSET)) goto fail;
+
+    u32 total = crh->sector_count;
+    ShowProgress(0, 0, "Hashing cartridge...");
+    u64 t0 = timer_start();
+    for (u32 sector = 0; sector < total; sector += REF_HASH_SECTORS) {
+        u32 n = min(REF_HASH_SECTORS, total - sector);
+        UINT br = 0;
+        if ((fvx_lseek(&cart, (u64) sector * CARTREF_SECTOR) != FR_OK) ||
+            (fvx_read(&cart, buf, n * CARTREF_SECTOR, &br) != FR_OK) || (br != n * CARTREF_SECTOR)) {
+            ShowPrompt(false, "Cartridge read error at %08llX.", (unsigned long long) sector * CARTREF_SECTOR);
+            goto fail;
+        }
+        for (u32 i = 0; i < n; i++) {
+            u8 sha[32];
+            sha_quick(sha, buf + (size_t) i * CARTREF_SECTOR, CARTREF_SECTOR, SHA256_MODE);
+            memcpy(hashes + (size_t) i * CRH_HASH_SIZE, sha, CRH_HASH_SIZE);
+        }
+        if ((fvx_write(&out, hashes, n * CRH_HASH_SIZE, &bw) != FR_OK) || (bw != n * CRH_HASH_SIZE)) {
+            ShowPrompt(false, "SD card write error.");
+            goto fail;
+        }
+        if (!ShowProgress((u64) sector + n, total, "Hashing cartridge...")) {
+            ShowPrompt(false, "Cancelled.");
+            goto fail;
+        }
+    }
+    ok = true;
+    ShowPrompt(false, "Reference hash created (%llu s):\n%s\n \nUse it with \"Fix with reference image\".",
+        (unsigned long long) timer_sec(t0), out_path);
+
+fail:
+    if (out_open) fvx_close(&out);
+    if (cart_open) fvx_close(&cart);
+    if (!ok && out_open) fvx_unlink(out_path); // never leave a half-written reference
+    free(buf);
+    free(hashes);
+    free(head);
+    return ok ? 0 : 1;
 }
