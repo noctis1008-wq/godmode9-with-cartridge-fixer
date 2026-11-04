@@ -1,3 +1,11 @@
+> **This is a modified version: GodMode9 Cartridge Fixer + "Fix with reference image" (RefFix).**
+> It is based on [skawo/GodMode9-with-Cartridge-Fixer](https://github.com/skawo/GodMode9-with-Cartridge-Fixer) 2.00,
+> which is based on [d0k3/GodMode9](https://github.com/d0k3/GodMode9). All credit for those goes to their authors.
+> The additions are **experimental and not yet proven on real hardware**: a full repair confirmed by Verify has not
+> been completed yet. Use it only on cartridges that are already broken, and keep your own backups.
+> Download: [GodMode9_RefFix.firm](https://github.com/noctis1008-wq/godmode9-with-cartridge-fixer/releases/latest/download/GodMode9_RefFix.firm)
+> · [What changed](#changes-in-this-version-reffix) · Japanese summary: [日本語](#日本語の概要)
+
 <h1>Nintendo 3DS Cartridge Fixer</h1>
 
 3DS cartridges contain a NAND flash chip, which, if unused for long periods of time, may become corrupted. Thankfully, the controller chip has an error correction function which can restore the corrupted data. 
@@ -5,6 +13,38 @@
 This fork of GodMode 9 has been edited to make more extensive use of this functionality; the program can now scan the cartridge for errors, and if they're found, will re-read the offending chunk of data while running the refresh function until it hopefully corrects itself. If your cartridge appears to load infinitely, or frequently crashes from non-gameplay-related reasons, this tool has a chance to fix it.
 
 <h2>Warning: This is EXPERIMENTAL software. This might not fix your cartridge, and while it shouldn't make them worse, there are no guarantees.</h2>
+
+## Changes in this version (RefFix)
+
+Everything from the original Cartridge Fixer 2.00 is unchanged and still available. Added:
+
+| Change | Files |
+|---|---|
+| **Fix with reference image**: compares the cartridge with a verified `.3ds` or a `.crh` hash file sector by sector (0x200 bytes) and re-reads with refresh only the sectors that differ, round-robin | `arm9/source/utils/cartref.c/.h` (engine), `arm9/source/utils/cartfixref.c/.h` (GodMode9 front end), `arm9/source/godmode.c` (menu) |
+| **.crh reference hash files** (~1/64 of the image): NCSD/NCCH headers + 8 bytes of SHA-256 per sector; created on a PC (`tools/make_crh.py`) or from a healthy cartridge (**Create reference hash (.crh)**) | `arm9/source/utils/cartrefhash.h`, `tools/make_crh.py` |
+| Decrypted reference images are supported (cartridge data is decrypted before comparing) | `cartfixref.c` |
+| Safety checks: per-partition match of layout and NCCH header, warning when a quarter or more of all sectors differ, decryption self-test | `cartfixref.c` |
+| Pause/resume (`SD:/gm9/out/cartref_<titleid>.dat`), auto start 10 s after the scan, optional auto retry rounds, time estimate, fixed-per-round history | `cartfixref.c`, `cartref.c` |
+| Detailed log in `SD:/luma/payloads/log/`; file browser starts in `SD:/luma/payloads/hash/` | `cartfixref.c` |
+| `CTR_GetRefreshCount()` | `arm9/source/gamecart/command_ctr.c/.h` |
+| Host unit tests for the engine and the `.crh` format | `tests/cartref/` |
+| CI ships `GodMode9_RefFix.firm` and publishes it as a release | `.github/workflows/ci.yml` |
+
+**Notes and risks**
+
+- The repair relies on the same cartridge refresh command as the original fixer and sends it many times. Its long-term effect on cartridges is unknown.
+- Do **not** share `.crh` files: besides hashes they contain copies of the game's NCSD/NCCH headers. Make your own from your own cartridge or dump.
+- Do not share game images (`.3ds`) either.
+
+## 日本語の概要
+
+この版は、GodMode9 Cartridge Fixer 2.00 に「Fix with reference image（正常なデータとの照合による修復）」を追加した**実験的な改造版**です。実機で最後まで修復しVerifyが通った例はまだありません。すでに壊れたカートリッジにだけ使い、バックアップを取ってから使ってください。
+
+- 正常な `.3ds`（暗号化・復号済みどちらでも可）か、`.crh` ハッシュファイルと照合し、違うセクタだけをリフレッシュしながら読み直します。
+- `.crh` はPC（`tools/make_crh.py`）か、正常なカートリッジ（「Create reference hash (.crh)」）から作れます。`SD:/luma/payloads/hash/` に置くと選びやすくなります。
+- 中断・再開、スキャン後の自動開始、自動リトライ、残り時間の目安、ラウンドごとの修復数の表示に対応しています。
+- ログは `SD:/luma/payloads/log/` に保存されます。
+- `.crh` や `.3ds` は他人と共有しないでください。
 
 ## Usage
 
