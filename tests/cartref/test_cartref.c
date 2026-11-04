@@ -62,6 +62,8 @@ static int m_ref_compare(void* ctx, uint32_t sector, uint32_t count, const void*
 }
 
 static void m_begin_pass(void* ctx) { ((Mock*) ctx)->passes++; }
+static uint32_t end_passes = 0;
+static void m_end_pass(void* ctx, const CartRefStatus* st) { (void) ctx; (void) st; end_passes++; }
 static bool m_abort(void* ctx) {
     Mock* m = ctx;
     m->polls++;
@@ -81,7 +83,7 @@ static Mock* new_mock(void) {
 static void free_mock(Mock* m) { free(m->ref); free(m); }
 
 static CartRefIo io_for(Mock* m) {
-    CartRefIo io = { m, m_cart_read, m_ref_compare, m_begin_pass, m_abort, NULL, NULL };
+    CartRefIo io = { m, m_cart_read, m_ref_compare, m_begin_pass, m_abort, NULL, NULL, m_end_pass };
     return io;
 }
 
@@ -126,6 +128,7 @@ static void test_scan_and_repair(void) {
     CHECK(find(&l, 3000)->attempts <= 12);
     // RECOVER needing 40 refreshes: fixed after ~40 attempts across passes
     CHECK(find(&l, 2047)->attempts >= 40 && find(&l, 2047)->attempts <= 41);
+    CHECK(end_passes == m->passes);
     printf("scan+repair: reads=%u refreshes=%u passes=%u\n", m->reads, m->refreshes, m->passes);
 
     free(buf);

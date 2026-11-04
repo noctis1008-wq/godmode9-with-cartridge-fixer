@@ -139,9 +139,11 @@ If you have a **verified .3ds of the same game and version** (it does not have t
 
 Why it is faster: the classic fixer can only check data against the game's own hashes, and some areas (ExeFS files such as `code.bin`) have one hash for several MB, so the whole area is re-read on every attempt. With a reference, only the damaged sectors are touched.
 
-- **B** pauses. Progress is saved to `SD:/gm9/out/cartref_<titleid>.dat`; run the option again to resume.
+- After the scan, the repair starts automatically after 10 seconds (A: start now, B: cancel).
+- The screen shows a rough estimate of the time left, based on how fast sectors have been resolved so far.
+- **B** pauses. Progress is saved to `SD:/gm9/out/cartref_<titleid>.dat` after every pass; run the option again to resume.
+- A detailed log (settings, scan speed, where the bad sectors are, a summary per pass, the result per sector) is written to `SD:/luma/payloads/log/` and updated after every pass.
 - Retry limit, stuck limit and autoskip are shared with the classic fixer settings.
-- A report is written to `SD:/gm9/out/reffix_report_*.txt`.
 - Run **Verify** afterwards. Partitions marked as different still need the classic **Fix cartridge corruption**.
 
 ## Options

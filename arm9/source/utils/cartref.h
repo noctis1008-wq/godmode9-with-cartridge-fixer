@@ -86,6 +86,8 @@ typedef struct {
     bool (*poll_skip)(void* ctx);
     // Progress display. May be NULL.
     void (*status)(void* ctx, const CartRefStatus* st);
+    // Called after every repair pass (save progress, write log). May be NULL.
+    void (*end_pass)(void* ctx, const CartRefStatus* st);
 } CartRefIo;
 
 typedef enum {

@@ -18,12 +18,17 @@
 #include "power.h"
 #include "rtc.h"
 
+#include <stdarg.h>
+
 #define REF_LIST_CAPACITY   (256u * 1024u)       // max. bad sectors tracked per run (128 MB of data)
 #define REF_HDR_TOLERANCE   32                   // differing bytes allowed in a damaged NCCH header
 #define REF_STATUS_MS       150
 #define REF_HASH_DIR        "0:/luma/payloads/hash"
-#define REF_REPORT_SIZE     STD_BUFFER_SIZE
-#define REF_REPORT_MAX_LINES 20000
+#define REF_LOG_DIR         "0:/luma/payloads/log"
+#define REF_LOG_EVENTS_SIZE (256u * 1024u)       // event part of the log
+#define REF_LOG_TABLE_SIZE  STD_BUFFER_SIZE      // per-sector table (rebuilt on every save)
+#define REF_LOG_MAX_LINES   20000
+#define REF_COUNTDOWN_SEC   10
 
 extern bool force_refresh;                       // command_ctr.c: refresh before every read
 u32 LoadNcsdHeader(NcsdHeader* ncsd, const char* path); // gameutil.c
@@ -56,11 +61,161 @@ typedef struct {
     FIL cart;
     RefSource* ref;
     RefPart parts[8];
+    u32 part_index[8];        // NCSD partition number of parts[i]
     u32 n_parts;
     u8* scratch;              // CARTREF_SCAN_CHUNK sectors, for decrypting cart data
+    // log + progress saving
+    char* log;                // event log text
+    size_t log_len;
+    bool log_full;
+    char log_path[96];
+    CartRefList* list;
+    const CartRefResumeHeader* rhdr;
+    const char* state_file;
+    u64 pass_timer;
+    u64 attempts_before_pass;
     u64 status_timer;
     u64 run_timer;
 } RefCtx;
+
+static void log_printf(RefCtx* ctx, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+static void log_printf(RefCtx* ctx, const char* fmt, ...) {
+    if (!ctx->log || ctx->log_full) return;
+    size_t avail = REF_LOG_EVENTS_SIZE - ctx->log_len;
+    if (avail < 64) {
+        ctx->log_len += snprintf(ctx->log + ctx->log_len, avail, "[event log full]\n");
+        ctx->log_full = true;
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(ctx->log + ctx->log_len, avail, fmt, ap);
+    va_end(ap);
+    if (n > 0) ctx->log_len += ((size_t) n < avail) ? (size_t) n : avail - 1;
+}
+
+static void log_time(RefCtx* ctx) {
+    DsTime t;
+    get_dstime(&t);
+    log_printf(ctx, "[20%02lX-%02lX-%02lX %02lX:%02lX:%02lX] ", (u32) t.bcd_Y, (u32) t.bcd_M, (u32) t.bcd_D,
+        (u32) t.bcd_h, (u32) t.bcd_m, (u32) t.bcd_s);
+}
+
+// Which part of the NCCH a sector belongs to (for the log).
+enum { RG_HEADER = 0, RG_EXHEADER, RG_LOGO, RG_PLAIN, RG_EXEFS, RG_ROMFS, RG_OTHER, RG_COUNT };
+static const char* rg_names[RG_COUNT] = { "header", "exheader", "logo", "plain", "exefs", "romfs", "other" };
+
+static u32 sector_region(const RefCtx* ctx, u32 sector, u32* part_out) {
+    for (u32 p = 0; p < ctx->n_parts; p++) {
+        const RefPart* part = ctx->parts + p;
+        if ((sector < part->start) || (sector >= part->start + part->count)) continue;
+        if (part_out) *part_out = ctx->part_index[p];
+        const NcchHeader* h = &part->ncch;
+        u32 u = sector - part->start; // in 0x200 units == NCCH media units
+        if (u == 0) return RG_HEADER;
+        if (h->size_exthdr && (u < 1 + 4)) return RG_EXHEADER;   // 0x200..0xA00 (exheader + AccessDesc)
+        if (h->size_logo && (u >= h->offset_logo) && (u < h->offset_logo + h->size_logo)) return RG_LOGO;
+        if (h->size_plain && (u >= h->offset_plain) && (u < h->offset_plain + h->size_plain)) return RG_PLAIN;
+        if (h->size_exefs && (u >= h->offset_exefs) && (u < h->offset_exefs + h->size_exefs)) return RG_EXEFS;
+        if (h->size_romfs && (u >= h->offset_romfs) && (u < h->offset_romfs + h->size_romfs)) return RG_ROMFS;
+        return RG_OTHER;
+    }
+    if (part_out) *part_out = 0xFF;
+    return RG_OTHER;
+}
+
+static void log_distribution(RefCtx* ctx, const CartRefList* list, bool only_unresolved) {
+    u32 counts[8][RG_COUNT];
+    memset(counts, 0, sizeof(counts));
+    for (u32 i = 0; i < list->count; i++) {
+        if (only_unresolved && (list->s[i].state == CARTREF_FIXED)) continue;
+        u32 part = 0;
+        u32 rg = sector_region(ctx, list->s[i].sector, &part);
+        if (part < 8) counts[part][rg]++;
+    }
+    for (u32 p = 0; p < 8; p++) {
+        u32 total = 0;
+        for (u32 r = 0; r < RG_COUNT; r++) total += counts[p][r];
+        if (!total) continue;
+        log_printf(ctx, "  content%lu: %lu sectors (", p, total);
+        for (u32 r = 0; r < RG_COUNT; r++)
+            if (counts[p][r]) log_printf(ctx, " %s=%lu", rg_names[r], counts[p][r]);
+        log_printf(ctx, " )\n");
+    }
+}
+
+// Write the log file: event log + current per-sector table.
+static void log_save(RefCtx* ctx) {
+    if (!ctx->log || !*ctx->log_path) return;
+    fvx_rmkdir(REF_LOG_DIR);
+    if (!FileSetData(ctx->log_path, ctx->log, ctx->log_len, 0, true)) return;
+    if (!ctx->list || !ctx->list->count) return;
+
+    char* buf = (char*) malloc(REF_LOG_TABLE_SIZE);
+    if (!buf) return;
+    static const char* names[] = { "PENDING", "FIXED", "UNFIXABLE", "SKIPPED" };
+    char* w = buf;
+    char* end = buf + REF_LOG_TABLE_SIZE - 64;
+    w += snprintf(w, end - w, "\n--- sectors (cart offset, state, region, attempts, stuck) ---\n");
+    u32 i = 0;
+    for (; (i < ctx->list->count) && (i < REF_LOG_MAX_LINES) && (w < end); i++) {
+        const CartRefSector* e = &ctx->list->s[i];
+        u32 part = 0;
+        u32 rg = sector_region(ctx, e->sector, &part);
+        w += snprintf(w, end - w, "%09llX %-9s c%lu/%-8s %6lu %4u\n",
+            (unsigned long long) e->sector * CARTREF_SECTOR, names[e->state & 3], part, rg_names[rg],
+            (unsigned long) e->attempts, (unsigned) e->stuck);
+    }
+    if (i < ctx->list->count) w += snprintf(w, buf + REF_LOG_TABLE_SIZE - w, "[%lu more not listed]\n", ctx->list->count - i);
+    FileSetData(ctx->log_path, buf, w - buf, ctx->log_len, false);
+    free(buf);
+}
+
+static bool save_state(RefCtx* ctx) {
+    if (!ctx->list || !ctx->rhdr || !ctx->state_file) return false;
+    CartRefStatus st;
+    CartRef_Count(ctx->list, &st);
+    if (!st.pending && !st.unfixable && !st.skipped) {
+        fvx_unlink(ctx->state_file);
+        return false;
+    }
+    size_t max = sizeof(CartRefResumeHeader) + (size_t) ctx->list->count * 4;
+    void* sdata = malloc(max);
+    size_t sz = sdata ? CartRef_SaveState(ctx->list, ctx->rhdr, sdata, max) : 0;
+    bool ok = false;
+    if (sz) {
+        fvx_rmkdir(OUTPUT_PATH);
+        ok = FileSetData(ctx->state_file, sdata, sz, 0, true);
+    }
+    free(sdata);
+    return ok;
+}
+
+static void io_end_pass(void* vctx, const CartRefStatus* st) {
+    RefCtx* ctx = (RefCtx*) vctx;
+    log_time(ctx);
+    log_printf(ctx, "pass %lu done in %llu s: remaining %lu, fixed %lu, unfixable %lu, skipped %lu, refresh reads %llu (total %llu)\n",
+        st->pass, (unsigned long long) timer_sec(ctx->pass_timer), st->pending, st->fixed, st->unfixable, st->skipped,
+        (unsigned long long) (st->total_attempts - ctx->attempts_before_pass), (unsigned long long) st->total_attempts);
+    ctx->attempts_before_pass = st->total_attempts;
+    ctx->pass_timer = timer_start();
+    // save progress and log after every pass, so nothing is lost on power-off
+    save_state(ctx);
+    log_save(ctx);
+}
+
+// Wait REF_COUNTDOWN_SEC seconds. Returns false if the user cancelled with B.
+static bool countdown(const char* msg) {
+    for (u32 t = REF_COUNTDOWN_SEC; t > 0; t--) {
+        ShowString("%s\n \nRepair starts in %lu s.\n \n(A) start now   (B) cancel", msg, t);
+        u64 t0 = timer_start();
+        while (timer_msec(t0) < 1000) {
+            if (CheckButton(BUTTON_A)) return true;
+            if (CheckButton(BUTTON_B)) return false;
+        }
+    }
+    return true;
+}
 
 static int io_cart_read(void* vctx, u32 sector, u32 count, void* buf, bool refresh) {
     RefCtx* ctx = (RefCtx*) vctx;
@@ -250,6 +405,15 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
     snprintf(line, sizeof(line), "Remaining  %-10lu              ", (unsigned long) st->pending);
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
+    // estimate from the rate at which sectors got resolved so far in this run
+    u32 resolved = st->fixed + st->unfixable + st->skipped;
+    if (resolved && (sec >= 30)) {
+        u64 eta = (u64) sec * st->pending / resolved;
+        if (eta > 99 * 3600 + 3599) eta = 99 * 3600 + 3599;
+        snprintf(line, sizeof(line), "Est. left  %02lu:%02lu:%02lu (rough)       ", (unsigned long) (eta / 3600),
+            (unsigned long) ((eta / 60) % 60), (unsigned long) (eta % 60));
+    } else snprintf(line, sizeof(line), "Est. left  estimating...          ");
+    DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
     snprintf(line, sizeof(line), "Fixed      %-10lu              ", (unsigned long) st->fixed);
     DrawString(MAIN_SCREEN, line, x, y, COLOR_GREEN, COLOR_STD_BG); y += lh;
     snprintf(line, sizeof(line), "Unfixable  %-10lu              ", (unsigned long) st->unfixable);
@@ -277,34 +441,6 @@ static u32 count_diff(const u8* a, const u8* b, u32 size) {
 
 static void state_path(char* out, size_t size, u64 title_id) {
     snprintf(out, size, "%s/cartref_%016llX.dat", OUTPUT_PATH, (unsigned long long) title_id);
-}
-
-static void write_report(const char* cart_path, const char* ref_path, const CartRefList* list,
-                         const char* partinfo, CartRefResult res) {
-    char* buf = (char*) malloc(REF_REPORT_SIZE);
-    if (!buf) return;
-    char* w = buf;
-    char* end = buf + REF_REPORT_SIZE - 64;
-    static const char* names[] = { "PENDING", "FIXED", "UNFIXABLE", "SKIPPED" };
-
-    w += snprintf(w, end - w, "REFERENCE FIX REPORT\ncart: %s\nref:  %s\nresult: %d\n%s\n",
-        cart_path, ref_path, (int) res, partinfo);
-    u32 lines = 0;
-    for (u32 i = 0; (i < list->count) && (w < end) && (lines < REF_REPORT_MAX_LINES); i++, lines++) {
-        const CartRefSector* s = &list->s[i];
-        w += snprintf(w, end - w, "%08lX %-9s attempts=%lu\n", (unsigned long) (s->sector * CARTREF_SECTOR),
-            names[s->state & 3], (unsigned long) s->attempts);
-    }
-    if (lines < list->count) w += snprintf(w, buf + REF_REPORT_SIZE - w, "[truncated]\n");
-
-    DsTime dstime;
-    get_dstime(&dstime);
-    char fileout[64];
-    snprintf(fileout, sizeof(fileout), "%s/reffix_report_%02lX%02lX%02lX%02lX%02lX%02lX.txt", OUTPUT_PATH,
-        (u32) dstime.bcd_Y, (u32) dstime.bcd_M, (u32) dstime.bcd_D,
-        (u32) dstime.bcd_h, (u32) dstime.bcd_m, (u32) dstime.bcd_s);
-    FileSetData(fileout, buf, w - buf, 0, true);
-    free(buf);
 }
 
 u32 FixCartWithReference(const char* cart_path) {
@@ -389,15 +525,17 @@ u32 FixCartWithReference(const char* cart_path) {
             else if (match && !ref_plain && cart_plain) match = false; // unexpected: decrypted cart
         }
         if (match) {
+            ctx.part_index[ctx.n_parts] = i;
             RefPart* part = ctx.parts + ctx.n_parts++;
             part->start = (u32) (offset / CARTREF_SECTOR);
             part->count = (u32) (size / CARTREF_SECTOR);
             part->decrypt = decrypt;
+            // reference header (undamaged) with the cartridge's crypto flags:
+            // used for decryption and to name regions in the log
+            memcpy(&part->ncch, ref->ncch[i], 0x200);
+            part->ncch.flags[3] = ch->flags[3];
+            part->ncch.flags[7] = ch->flags[7];
             if (decrypt) {
-                // reference header (undamaged) with the cartridge's crypto flags
-                memcpy(&part->ncch, ref->ncch[i], 0x200);
-                part->ncch.flags[3] = ch->flags[3];
-                part->ncch.flags[7] = ch->flags[7];
                 part->has_exefs = (rh->size_exefs != 0);
                 memcpy(&part->exefs, ref->exefs[i], 0x200);
                 n_decrypt++;
@@ -487,9 +625,34 @@ u32 FixCartWithReference(const char* cart_path) {
             goto done;
         }
     }
+    // log: SD:/luma/payloads/log/reffix_<titleid>_<date>.log
+    ctx.log = (char*) malloc(REF_LOG_EVENTS_SIZE);
+    if (ctx.log) {
+        DsTime t;
+        get_dstime(&t);
+        snprintf(ctx.log_path, sizeof(ctx.log_path), "%s/reffix_%016llX_%02lX%02lX%02lX_%02lX%02lX%02lX.log", REF_LOG_DIR,
+            (unsigned long long) ncsd_cart.mediaId, (u32) t.bcd_Y, (u32) t.bcd_M, (u32) t.bcd_D,
+            (u32) t.bcd_h, (u32) t.bcd_m, (u32) t.bcd_s);
+        log_time(&ctx);
+        log_printf(&ctx, "Fix with reference image - GodMode9 %s (%s)\n", VERSION, DBUILTL);
+        log_printf(&ctx, "cart: %s  title %016llX  size %llu\n", cart_path, (unsigned long long) ncsd_cart.mediaId,
+            (unsigned long long) cart_size);
+        log_printf(&ctx, "ref:  %s  (%s, image size %llu)\n", ref_path, ref->is_hash ? "hash file" : "full image",
+            (unsigned long long) ref_size);
+        log_printf(&ctx, "%s", partinfo);
+        FixerCfg_Load(&fixer_cfg);
+        log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5\n",
+            fixer_cfg.stuck_limit, fixer_cfg.retries_before_skip, fixer_cfg.autoskip ? 1 : 0);
+        if (*FixerSim_Status()) log_printf(&ctx, "SIM BUILD: %s\n", FixerSim_Status());
+        log_printf(&ctx, "%s\n", resumed ? "resumed from saved progress" : "new scan");
+    }
+    ctx.list = &list;
+    ctx.rhdr = &rhdr;
+    ctx.state_file = spath;
+
     ctx.status_timer = ctx.run_timer = timer_start();
 
-    CartRefIo io = { &ctx, io_cart_read, io_ref_compare, io_begin_pass, io_poll_abort, io_poll_skip, io_status };
+    CartRefIo io = { &ctx, io_cart_read, io_ref_compare, io_begin_pass, io_poll_abort, io_poll_skip, io_status, io_end_pass };
     CartRefResult res = CARTREF_OK;
 
     if (!resumed) {
@@ -497,11 +660,25 @@ u32 FixCartWithReference(const char* cart_path) {
         if (!buf) res = CARTREF_NO_MEMORY;
         else {
             ShowProgress(0, 0, "Scanning...");
+            u64 scan_timer = timer_start();
             res = CartRef_Scan(&io, ranges, n_ranges, &list, buf);
+            u64 scan_ms = timer_msec(scan_timer);
             free(buf);
+            u64 scan_bytes = 0;
+            for (u32 r = 0; r < n_ranges; r++) scan_bytes += (u64) ranges[r].count * CARTREF_SECTOR;
+            log_time(&ctx);
+            log_printf(&ctx, "scan: result %d, %llu MB in %llu.%01llu s (%llu KB/s), %lu%s bad sectors\n", (int) res,
+                (unsigned long long) (scan_bytes >> 20), (unsigned long long) (scan_ms / 1000),
+                (unsigned long long) ((scan_ms % 1000) / 100),
+                (unsigned long long) (scan_ms ? (scan_bytes / 1024) * 1000 / scan_ms : 0),
+                list.count, list.overflow ? "+" : "");
+            log_distribution(&ctx, &list, false);
+            log_save(&ctx);
         }
         if ((res == CARTREF_OK) && !list.count) {
             fvx_unlink(spath);
+            log_printf(&ctx, "no differences found\n");
+            log_save(&ctx);
             ShowPrompt(false, "%s\nNo differences found in the\nmatching partitions.%s", pathstr,
                 n_unmatched ? "\n \nOther partitions were not checked;\nuse \"Fix cartridge corruption\"." : "");
             ret = 0;
@@ -515,13 +692,21 @@ u32 FixCartWithReference(const char* cart_path) {
                     list.count, list.overflow ? "+" : "", (unsigned long long) total_sectors)) {
                 res = CARTREF_ABORTED;
                 list.count = 0; // nothing worth saving
+                log_printf(&ctx, "user declined: too many differences (wrong reference?)\n");
             }
         }
-        if ((res == CARTREF_OK) && list.overflow)
-            ShowPrompt(false, "More than %lu bad sectors.\nThe first %lu will be fixed now;\nrun this again afterwards.",
-                (unsigned long) REF_LIST_CAPACITY, (unsigned long) REF_LIST_CAPACITY);
-        else if (res == CARTREF_OK)
-            ShowPrompt(false, "%lu bad sectors found (%lu KB).\nStarting repair.", list.count, list.count / 2);
+        if (res == CARTREF_OK) {
+            char msg[160];
+            if (list.overflow)
+                snprintf(msg, sizeof(msg), "More than %lu bad sectors.\nThe first %lu will be fixed now;\nrun this again afterwards.",
+                    (unsigned long) REF_LIST_CAPACITY, (unsigned long) REF_LIST_CAPACITY);
+            else snprintf(msg, sizeof(msg), "%lu bad sectors found (%lu KB).", list.count, list.count / 2);
+            save_state(&ctx); // the scan result survives even if the repair never starts
+            if (!countdown(msg)) {
+                res = CARTREF_ABORTED;
+                log_printf(&ctx, "repair cancelled at the countdown\n");
+            }
+        }
     }
 
     if (res == CARTREF_OK) {
@@ -534,6 +719,10 @@ u32 FixCartWithReference(const char* cart_path) {
 
         ClearScreenF(true, false, COLOR_STD_BG);
         CTR_ResetRefreshCount();
+        log_time(&ctx);
+        log_printf(&ctx, "repair start: %lu sectors\n", list.count);
+        ctx.run_timer = ctx.pass_timer = timer_start();
+        ctx.attempts_before_pass = 0;
         res = CartRef_Repair(&io, &params, &list);
         ClearScreenF(true, false, COLOR_STD_BG);
     }
@@ -549,18 +738,16 @@ u32 FixCartWithReference(const char* cart_path) {
 
     CartRefStatus st;
     CartRef_Count(&list, &st);
-    bool saved = false;
+    bool saved = save_state(&ctx);
+    log_time(&ctx);
+    log_printf(&ctx, "end: result %d after %llu s: fixed %lu, unfixable %lu, skipped %lu, remaining %lu, refresh count %lu\n",
+        (int) res, (unsigned long long) timer_sec(ctx.run_timer), st.fixed, st.unfixable, st.skipped, st.pending,
+        (unsigned long) CTR_GetRefreshCount());
     if (st.pending || st.unfixable || st.skipped) {
-        size_t max = sizeof(CartRefResumeHeader) + (size_t) list.count * 4;
-        void* sdata = malloc(max);
-        size_t sz = sdata ? CartRef_SaveState(&list, &rhdr, sdata, max) : 0;
-        if (sz) {
-            fvx_rmkdir(OUTPUT_PATH);
-            saved = FileSetData(spath, sdata, sz, 0, true);
-        }
-        free(sdata);
-    } else fvx_unlink(spath);
-    write_report(cart_path, ref_path, &list, partinfo, res);
+        log_printf(&ctx, "unresolved by region:\n");
+        log_distribution(&ctx, &list, true);
+    }
+    log_save(&ctx);
 
     const char* why =
         (res == CARTREF_ABORTED)    ? "Stopped." :
@@ -569,13 +756,14 @@ u32 FixCartWithReference(const char* cart_path) {
         (res == CARTREF_NO_MEMORY)  ? "Out of memory." : "Finished.";
     ShowPrompt(false, "%s\n \nFixed: %lu\nUnfixable: %lu\nSkipped: %lu\nRemaining: %lu\n \n%s%s",
         why, st.fixed, st.unfixable, st.skipped, st.pending,
-        saved ? "Progress saved - run again to continue.\n" : "",
+        saved ? "Progress saved - run again to continue.\nLog: luma/payloads/log\n" : "Log: luma/payloads/log\n",
         (res == CARTREF_OK && !st.unfixable && !st.skipped) ? "Run Verify to confirm." : "");
     ret = (res == CARTREF_OK) ? 0 : 1;
 
 done:
     if (cart_open) fvx_close(&ctx.cart);
     free(ctx.scratch);
+    free(ctx.log);
     if (list.s) CartRef_ListFree(&list);
     ref_close(ref);
     return ret;

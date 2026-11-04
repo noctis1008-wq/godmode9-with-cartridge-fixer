@@ -192,6 +192,9 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
             CartRef_Count(list, &st);
             report(io, &st);
         }
+
+        CartRef_Count(list, &st);
+        if (io->end_pass) io->end_pass(io->ctx, &st);
     }
 }
 

@@ -6,6 +6,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container: devkitpro/devkitarm
+    permissions:
+      contents: write   # publish the .firm as a release asset
 
     steps:
       - uses: actions/checkout@v4
@@ -48,3 +50,17 @@ jobs:
           name: ${{ env.OUTNAME }}
           path: release/*
           if-no-files-found: error
+
+      - name: Publish GodMode9_RefFix.firm as a release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/reference-fix'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: reffix-${{ github.run_number }}
+          name: GodMode9_RefFix build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: release/GodMode9_RefFix.firm
+          body: |
+            Cartridge Fixer with "Fix with reference image" (branch reference-fix, commit ${{ github.sha }}).
+            Copy GodMode9_RefFix.firm to SD:/luma/payloads/.
+            Always-current download: https://github.com/${{ github.repository }}/releases/latest/download/GodMode9_RefFix.firm

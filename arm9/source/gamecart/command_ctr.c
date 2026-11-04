@@ -19,6 +19,11 @@ static bool CTR_CmdC5()
     return CTR_SendCommand(c5_cmd, 0, 1, 0x100002C, NULL);
 }
 
+int CTR_GetRefreshCount(void)
+{
+    return refresh_count;
+}
+
 void CTR_ResetRefreshCount()
 {
     refresh_count = 0;
