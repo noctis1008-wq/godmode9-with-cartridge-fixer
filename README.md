@@ -126,6 +126,23 @@ If verification persistently fails, and fixed chunk/unfixable chunk plateaus, **
 
 ---
 
+## Fix with reference image (faster)
+
+If you have a **verified .3ds of the same game and version** (it does not have to come from the same cartridge), you can use it as a reference:
+
+1. Copy the reference `.3ds` anywhere on the SD card.
+2. In `[C:] GAMECART`, press A on the `.3ds` file, then choose **Fix with reference image**.
+3. Select the reference file. Each partition is checked: only partitions whose layout and NCCH header match the cartridge are used (a different update partition is skipped and reported).
+4. Optionally verify the reference first (recommended).
+5. The cartridge is compared with the reference sector by sector (0x200 bytes). Only the sectors that differ are re-read with the refresh command, round-robin, until each one reads correctly 5 times in a row without refresh.
+
+Why it is faster: the classic fixer can only check data against the game's own hashes, and some areas (ExeFS files such as `code.bin`) have one hash for several MB, so the whole area is re-read on every attempt. With a reference, only the damaged sectors are touched.
+
+- **B** pauses. Progress is saved to `SD:/gm9/out/cartref_<titleid>.dat`; run the option again to resume.
+- Retry limit, stuck limit and autoskip are shared with the classic fixer settings.
+- A report is written to `SD:/gm9/out/reffix_report_*.txt`.
+- Run **Verify** afterwards. Partitions marked as different still need the classic **Fix cartridge corruption**.
+
 ## Options
 
 Selecting **Fix cartridge corruption** opens a pre-flight screen where the behaviour is configured:

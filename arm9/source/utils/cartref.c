@@ -1,0 +1,240 @@
+#include "cartref.h"
+
+#include <string.h>
+#include <stdlib.h>
+
+// Consecutive failed cartridge reads before giving up (each one already waited
+// for the command timeout).
+#define CARTREF_MAX_READ_FAILS 3
+
+void CartRef_DefaultParams(CartRefParams* p) {
+    p->stuck_limit = 50;
+    p->retries_before_skip = 500;
+    p->autoskip = false;
+    p->attempts_per_visit = 4;
+    p->confirm_reads = 5;
+}
+
+bool CartRef_ListInit(CartRefList* l, uint32_t capacity) {
+    l->count = 0;
+    l->overflow = false;
+    l->capacity = capacity;
+    l->s = (CartRefSector*) malloc((size_t) capacity * sizeof(CartRefSector));
+    if (!l->s) l->capacity = 0;
+    return l->s != NULL;
+}
+
+void CartRef_ListFree(CartRefList* l) {
+    free(l->s);
+    l->s = NULL;
+    l->count = l->capacity = 0;
+}
+
+bool CartRef_ListAdd(CartRefList* l, uint32_t sector) {
+    if (l->count >= l->capacity) {
+        l->overflow = true;
+        return false;
+    }
+    CartRefSector* e = &l->s[l->count++];
+    memset(e, 0, sizeof(*e));
+    e->sector = sector;
+    e->state = CARTREF_PENDING;
+    return true;
+}
+
+void CartRef_Count(const CartRefList* l, CartRefStatus* st) {
+    st->pending = st->fixed = st->unfixable = st->skipped = 0;
+    for (uint32_t i = 0; i < l->count; i++) {
+        switch (l->s[i].state) {
+            case CARTREF_PENDING:   st->pending++; break;
+            case CARTREF_FIXED:     st->fixed++; break;
+            case CARTREF_UNFIXABLE: st->unfixable++; break;
+            default:                st->skipped++; break;
+        }
+    }
+}
+
+static uint32_t sector_sum(const uint8_t* b) {
+    uint32_t h = 2166136261u; // FNV-1a
+    for (uint32_t i = 0; i < CARTREF_SECTOR; i++) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void report(const CartRefIo* io, const CartRefStatus* st) {
+    if (io->status) io->status(io->ctx, st);
+}
+
+CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint32_t n_ranges,
+                           CartRefList* list, uint8_t* buf) {
+    uint8_t* cbuf = buf;
+    uint8_t* rbuf = buf + (size_t) CARTREF_SCAN_CHUNK * CARTREF_SECTOR;
+
+    CartRefStatus st;
+    memset(&st, 0, sizeof(st));
+    st.phase = CARTREF_PHASE_SCAN;
+    for (uint32_t r = 0; r < n_ranges; r++)
+        st.total += ranges[r].count;
+
+    for (uint32_t r = 0; r < n_ranges; r++) {
+        for (uint32_t off = 0; off < ranges[r].count; off += CARTREF_SCAN_CHUNK) {
+            uint32_t n = ranges[r].count - off;
+            if (n > CARTREF_SCAN_CHUNK) n = CARTREF_SCAN_CHUNK;
+            uint32_t sector = ranges[r].start + off;
+
+            if (io->poll_abort && io->poll_abort(io->ctx))
+                return CARTREF_ABORTED;
+
+            int fails = 0;
+            while (io->cart_read(io->ctx, sector, n, cbuf, false) != 0) {
+                if (++fails >= CARTREF_MAX_READ_FAILS)
+                    return CARTREF_CART_ERROR;
+            }
+            if (io->ref_read(io->ctx, sector, n, rbuf) != 0)
+                return CARTREF_REF_ERROR;
+
+            for (uint32_t i = 0; i < n; i++) {
+                size_t o = (size_t) i * CARTREF_SECTOR;
+                if (memcmp(cbuf + o, rbuf + o, CARTREF_SECTOR) != 0) {
+                    if (!CartRef_ListAdd(list, sector + i))
+                        return CARTREF_OK; // list full: work on what we have
+                }
+            }
+
+            st.done += n;
+            st.pending = list->count;
+            report(io, &st);
+        }
+    }
+    return CARTREF_OK;
+}
+
+CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRefList* list) {
+    uint8_t cbuf[CARTREF_SECTOR];
+    uint8_t rbuf[CARTREF_SECTOR];
+    uint32_t apv = p->attempts_per_visit ? p->attempts_per_visit : 1;
+    int read_fails = 0;
+
+    CartRefStatus st;
+    memset(&st, 0, sizeof(st));
+    st.phase = CARTREF_PHASE_REPAIR;
+
+    for (;;) {
+        CartRef_Count(list, &st);
+        if (!st.pending) {
+            report(io, &st);
+            return CARTREF_OK;
+        }
+
+        st.pass++;
+        if (io->begin_pass) io->begin_pass(io->ctx);
+
+        for (uint32_t i = 0; i < list->count; i++) {
+            CartRefSector* s = &list->s[i];
+            if (s->state != CARTREF_PENDING) continue;
+
+            if (io->poll_abort && io->poll_abort(io->ctx))
+                return CARTREF_ABORTED;
+            if (io->ref_read(io->ctx, s->sector, 1, rbuf) != 0)
+                return CARTREF_REF_ERROR;
+
+            for (uint32_t a = 0; (a < apv) && (s->state == CARTREF_PENDING); a++) {
+                if (io->cart_read(io->ctx, s->sector, 1, cbuf, true) != 0) {
+                    if (++read_fails >= CARTREF_MAX_READ_FAILS) return CARTREF_CART_ERROR;
+                    continue;
+                }
+                read_fails = 0;
+                s->attempts++;
+                st.total_attempts++;
+
+                bool match = (memcmp(cbuf, rbuf, CARTREF_SECTOR) == 0);
+                if (match) {
+                    // Make sure it stays correct on plain reads (no refresh).
+                    for (uint32_t c = 0; c < p->confirm_reads; c++) {
+                        if (io->cart_read(io->ctx, s->sector, 1, cbuf, false) != 0) {
+                            if (++read_fails >= CARTREF_MAX_READ_FAILS) return CARTREF_CART_ERROR;
+                            match = false;
+                            break;
+                        }
+                        read_fails = 0;
+                        if (memcmp(cbuf, rbuf, CARTREF_SECTOR) != 0) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        s->state = CARTREF_FIXED;
+                        break;
+                    }
+                    if (read_fails) continue; // read error: no data to judge
+                }
+
+                uint32_t sum = sector_sum(cbuf);
+                if ((s->attempts > 1) && (sum == s->last_sum)) {
+                    s->stuck++;
+                } else {
+                    s->stuck = 0;
+                    s->last_sum = sum;
+                }
+
+                if (p->stuck_limit && (s->stuck >= p->stuck_limit)) {
+                    s->state = CARTREF_UNFIXABLE;
+                } else if (s->attempts >= p->retries_before_skip) {
+                    if (p->autoskip || (io->poll_skip && io->poll_skip(io->ctx)))
+                        s->state = CARTREF_SKIPPED;
+                }
+            }
+
+            st.current_sector = s->sector;
+            st.current_attempts = s->attempts;
+            CartRef_Count(list, &st);
+            report(io, &st);
+        }
+    }
+}
+
+size_t CartRef_SaveState(const CartRefList* l, const CartRefResumeHeader* hdr, void* out, size_t out_size) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < l->count; i++)
+        if (l->s[i].state != CARTREF_FIXED) n++;
+
+    size_t size = sizeof(CartRefResumeHeader) + (size_t) n * sizeof(uint32_t);
+    if (size > out_size) return 0;
+
+    CartRefResumeHeader h = *hdr;
+    h.magic = CARTREF_MAGIC;
+    h.version = CARTREF_VERSION;
+    h.count = n;
+    h.reserved = 0;
+    memcpy(out, &h, sizeof(h));
+
+    uint8_t* w = (uint8_t*) out + sizeof(h);
+    for (uint32_t i = 0; i < l->count; i++) {
+        if (l->s[i].state == CARTREF_FIXED) continue;
+        memcpy(w, &l->s[i].sector, sizeof(uint32_t));
+        w += sizeof(uint32_t);
+    }
+    return size;
+}
+
+bool CartRef_LoadState(CartRefList* l, const CartRefResumeHeader* expect, const void* data, size_t size) {
+    CartRefResumeHeader h;
+    if (size < sizeof(h)) return false;
+    memcpy(&h, data, sizeof(h));
+    if ((h.magic != CARTREF_MAGIC) || (h.version != CARTREF_VERSION)) return false;
+    if ((h.title_id != expect->title_id) || (h.cart_size != expect->cart_size) ||
+        (h.ref_size != expect->ref_size)) return false;
+    if (size != sizeof(h) + (size_t) h.count * sizeof(uint32_t)) return false;
+
+    const uint8_t* rd = (const uint8_t*) data + sizeof(h);
+    uint32_t max_sector = (uint32_t) (h.cart_size / CARTREF_SECTOR);
+    for (uint32_t i = 0; i < h.count; i++) {
+        uint32_t sector;
+        memcpy(&sector, rd + (size_t) i * sizeof(uint32_t), sizeof(uint32_t));
+        if (sector >= max_sector) return false;
+        if (!CartRef_ListAdd(l, sector)) break;
+    }
+    return true;
+}
