@@ -144,6 +144,7 @@ Why it is faster: the classic fixer can only check data against the game's own h
 - After the scan, the repair starts automatically after 10 seconds (A: start now, B: cancel).
 - **Auto retry** (chosen before each run, remembered): when a round ends with sectors still unfixable or skipped, they are reset and a new round starts automatically after 10 seconds.
 - The screen shows a rough estimate of the time left, based on how fast sectors have been resolved so far.
+- The two bottom rows show how many sectors each round fixed (newest 10; `*` = the running round).
 - **B** pauses. Progress is saved to `SD:/gm9/out/cartref_<titleid>.dat` after every pass; run the option again to resume.
 - A detailed log (settings, scan speed, where the bad sectors are, a summary per pass, the result per sector) is written to `SD:/luma/payloads/log/` and updated after every pass.
 - Retry limit, stuck limit and autoskip are shared with the classic fixer settings.

@@ -29,6 +29,7 @@
 #define REF_LOG_TABLE_SIZE  STD_BUFFER_SIZE      // per-sector table (rebuilt on every save)
 #define REF_LOG_MAX_LINES   20000
 #define REF_COUNTDOWN_SEC   10
+#define REF_HISTORY         10                   // rounds shown in the "fixed per round" rows
 #define REF_CFG_PATH        OUTPUT_PATH "/reffix.cfg"
 #define REF_HASH_SECTORS    0x800u               // sectors hashed per read when creating a .crh
 
@@ -77,6 +78,9 @@ typedef struct {
     u64 pass_timer;
     u64 attempts_before_pass;
     u32 round;                // repair round (auto retry)
+    u32 fixed_at_round_start; // to count the sectors fixed in the current round
+    u32 round_fixed[REF_HISTORY]; // sectors fixed in the last finished rounds (ring buffer)
+    u32 rounds_done;
     u64 status_timer;
     u64 run_timer;
 } RefCtx;
@@ -457,6 +461,51 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += 2 * lh;
     DrawString(MAIN_SCREEN, "B: pause (progress is saved)", x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
     DrawString(MAIN_SCREEN, "Hold Y: skip sector at retry limit", x, y, COLOR_STD_FONT, COLOR_STD_BG);
+
+    // bottom two rows: sectors fixed per round, newest 10 (the running round last, marked *)
+    u32 vals[REF_HISTORY], rnds[REF_HISTORY];
+    u32 n = 0;
+    u32 first = (ctx->rounds_done >= REF_HISTORY) ? ctx->rounds_done - (REF_HISTORY - 1) : 0;
+    for (u32 r = first; r < ctx->rounds_done; r++, n++) {
+        vals[n] = ctx->round_fixed[r % REF_HISTORY];
+        rnds[n] = r + 1;
+    }
+    vals[n] = st->fixed - ctx->fixed_at_round_start; // running round
+    rnds[n] = ctx->round;
+    n++;
+    // wrap the newest entries into two rows that fit the screen; drop the oldest if needed
+    const u32 maxw = (SCREEN_WIDTH_MAIN - x) / FONT_WIDTH_EXT - 1;
+    char tok[REF_HISTORY][16];
+    u32 tlen[REF_HISTORY];
+    for (u32 i = 0; i < n; i++)
+        tlen[i] = snprintf(tok[i], sizeof(tok[i]), "R%lu:%lu%s", (unsigned long) rnds[i], (unsigned long) vals[i],
+            (i == n - 1) ? "*" : "");
+    u32 start = 0;
+    for (; start < n; start++) { // first start index whose tokens fit in two rows
+        u32 rows = 1, w = 0;
+        for (u32 i = start; i < n; i++) {
+            u32 need = tlen[i] + (w ? 1 : 0);
+            if (w + need > maxw) { rows++; w = tlen[i]; }
+            else w += need;
+        }
+        if (rows <= 2) break;
+    }
+    char row[2][64];
+    u32 k = 0, w = 0;
+    row[0][0] = row[1][0] = '\0';
+    for (u32 i = start; (i < n) && (k < 2); i++) {
+        u32 need = tlen[i] + (w ? 1 : 0);
+        if (w + need > maxw) { k++; w = 0; need = tlen[i]; if (k >= 2) break; }
+        snprintf(row[k] + w, sizeof(row[k]) - w, "%s%s", w ? " " : "", tok[i]);
+        w += need;
+    }
+    for (u32 r = 0; r < 2; r++) { // pad to clear leftovers from the previous draw
+        u32 l = strlen(row[r]);
+        while ((l < maxw) && (l < sizeof(row[r]) - 1)) row[r][l++] = ' ';
+        row[r][l] = '\0';
+    }
+    DrawString(MAIN_SCREEN, row[0], x, SCREEN_HEIGHT - 2 * lh - 2, COLOR_GREEN, COLOR_STD_BG);
+    DrawString(MAIN_SCREEN, row[1], x, SCREEN_HEIGHT - lh - 2, COLOR_GREEN, COLOR_STD_BG);
 }
 
 static bool is_gamecart_path(const char* path) {
@@ -762,10 +811,13 @@ u32 FixCartWithReference(const char* cart_path) {
             ctx.run_timer = ctx.pass_timer = timer_start();
             ctx.attempts_before_pass = 0;
             ClearScreenF(true, false, COLOR_STD_BG);
+            ctx.fixed_at_round_start = rs.fixed;
             res = CartRef_Repair(&io, &params, &list);
             ClearScreenF(true, false, COLOR_STD_BG);
 
             CartRef_Count(&list, &rs);
+            ctx.round_fixed[ctx.rounds_done % REF_HISTORY] = rs.fixed - ctx.fixed_at_round_start;
+            ctx.rounds_done++;
             log_time(&ctx);
             log_printf(&ctx, "round %lu end: result %d, fixed %lu, unfixable %lu, skipped %lu, remaining %lu (%llu s)\n",
                 ctx.round, (int) res, rs.fixed, rs.unfixable, rs.skipped, rs.pending,
