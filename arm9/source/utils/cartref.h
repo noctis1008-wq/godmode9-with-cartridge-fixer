@@ -125,7 +125,7 @@ typedef struct {
 } CartRefResumeHeader;
 
 #define CARTREF_MAGIC   0x31464352u  // "CRF1"
-#define CARTREF_VERSION 1u
+#define CARTREF_VERSION 2u
 
 // Serialise unresolved (PENDING / UNFIXABLE / SKIPPED) sectors into `out`
 // (header + u32 list). Returns the byte size, or 0 if `out_size` is too small.

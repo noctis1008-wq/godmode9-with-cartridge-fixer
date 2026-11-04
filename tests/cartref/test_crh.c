@@ -30,7 +30,13 @@ int main(int argc, char** argv) {
     CHECK(memcmp(crh + CRH_NCSD_OFFSET, img, 0x200) == 0);
     for (int i = 0; i < 8; i++) {
         uint32_t off, sz; memcpy(&off, img + 0x120 + 8 * i, 4); memcpy(&sz, img + 0x124 + 8 * i, 4);
-        if (sz) CHECK(memcmp(crh + CRH_NCCH_OFFSET + i * 0x200, img + (size_t) off * 0x200, 0x200) == 0);
+        if (!sz) continue;
+        const unsigned char* n = img + (size_t) off * 0x200;
+        CHECK(memcmp(crh + CRH_NCCH_OFFSET + i * 0x200, n, 0x200) == 0);
+        uint32_t eoff; memcpy(&eoff, n + 0x1A0, 4);
+        static const unsigned char zero[0x200];
+        if (n[0x18F] & 4) CHECK(memcmp(crh + CRH_EXEFS_OFFSET + i * 0x200, n + (size_t) eoff * 0x200, 0x200) == 0);
+        else CHECK(memcmp(crh + CRH_EXEFS_OFFSET + i * 0x200, zero, 0x200) == 0);
     }
     for (uint32_t s = 0; s < h.sector_count; s++) {
         unsigned char d[32];

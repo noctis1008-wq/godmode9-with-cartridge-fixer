@@ -33,6 +33,7 @@ typedef struct {
     FIL file;
     NcsdHeader ncsd;
     u8 ncch[8][0x200];        // each partition's NCCH header
+    u8 exefs[8][0x200];       // each partition's ExeFS header (decrypted refs only)
     u64 image_size;
     u32 table_offset;         // hash list only
     u8* chunk;                // reference data / hashes for one scan chunk
@@ -41,9 +42,21 @@ typedef struct {
     u8 cache[CARTREF_SECTOR];
 } RefSource;
 
+// One cartridge partition that is compared against the reference.
+typedef struct {
+    u32 start, count;         // sectors
+    bool decrypt;             // reference is decrypted: decrypt cart data first
+    NcchHeader ncch;          // cartridge NCCH header (crypto flags of the cart)
+    ExeFsHeader exefs;        // decrypted ExeFS header (from the reference)
+    bool has_exefs;
+} RefPart;
+
 typedef struct {
     FIL cart;
     RefSource* ref;
+    RefPart parts[8];
+    u32 n_parts;
+    u8* scratch;              // CARTREF_SCAN_CHUNK sectors, for decrypting cart data
     u64 status_timer;
     u64 run_timer;
 } RefCtx;
@@ -85,8 +98,25 @@ static bool ref_match_one(RefSource* ref, const u8* cart, const u8* refdata) {
 }
 
 static int io_ref_compare(void* vctx, u32 sector, u32 count, const void* cart_buf, u8* match) {
-    RefSource* ref = ((RefCtx*) vctx)->ref;
+    RefCtx* ctx = (RefCtx*) vctx;
+    RefSource* ref = ctx->ref;
     const u8* cart = (const u8*) cart_buf;
+
+    if (count > CARTREF_SCAN_CHUNK) return 1;
+
+    // decrypted reference: bring the cartridge data into the same (decrypted) form
+    for (u32 p = 0; p < ctx->n_parts; p++) {
+        RefPart* part = ctx->parts + p;
+        if ((sector < part->start) || (sector >= part->start + part->count)) continue;
+        if (!part->decrypt) break;
+        if (sector + count > part->start + part->count) return 1; // never spans partitions
+        memcpy(ctx->scratch, cart, (size_t) count * CARTREF_SECTOR);
+        if (CryptNcch(ctx->scratch, (sector - part->start) * CARTREF_SECTOR, count * CARTREF_SECTOR,
+                &part->ncch, part->has_exefs ? &part->exefs : NULL, NCCH_NOCRYPTO) != 0)
+            return 1;
+        cart = ctx->scratch;
+        break;
+    }
     u32 unit = ref->is_hash ? CRH_HASH_SIZE : CARTREF_SECTOR;
     const u8* refdata;
 
@@ -98,7 +128,6 @@ static int io_ref_compare(void* vctx, u32 sector, u32 count, const void* cart_bu
         }
         refdata = ref->cache;
     } else {
-        if (count > CARTREF_SCAN_CHUNK) return 1;
         if (ref_load(ref, sector, count, ref->chunk) != 0) return 1;
         refdata = ref->chunk;
     }
@@ -134,10 +163,11 @@ static RefSource* ref_open(const char* path) {
             (fsize == crh.table_offset + (u64) crh.sector_count * CRH_HASH_SIZE) &&
             (ref_read_at(ref, CRH_NCSD_OFFSET, &ref->ncsd, sizeof(NcsdHeader)) == 0) &&
             (ref_read_at(ref, CRH_NCCH_OFFSET, ref->ncch, sizeof(ref->ncch)) == 0) &&
+            (ref_read_at(ref, CRH_EXEFS_OFFSET, ref->exefs, sizeof(ref->exefs)) == 0) &&
             (ValidateNcsdHeader(&ref->ncsd) == 0) && (ref->ncsd.mediaId == crh.title_id);
         ref->image_size = crh.image_size;
         ref->table_offset = crh.table_offset;
-        if (!ok) ShowPrompt(false, "%s\nInvalid or damaged .crh hash file.", pathstr);
+        if (!ok) ShowPrompt(false, "%s\nInvalid or outdated .crh hash file.\nCreate it again with make_crh.py.", pathstr);
     } else {
         ref->image_size = fsize;
         ok = (ref_read_at(ref, 0, &ref->ncsd, sizeof(NcsdHeader)) == 0) &&
@@ -145,8 +175,13 @@ static RefSource* ref_open(const char* path) {
         for (u32 i = 0; ok && (i < 8); i++) {
             NcchPartition* p = ref->ncsd.partitions + i;
             u64 off = (u64) p->offset * NCSD_MEDIA_UNIT;
-            if (p->size && (off + 0x200 <= fsize))
-                ok = (ref_read_at(ref, off, ref->ncch[i], 0x200) == 0);
+            if (p->size && (off + 0x200 <= fsize)) {
+                NcchHeader* h = (NcchHeader*) (void*) ref->ncch[i];
+                ok = (ref_read_at(ref, off, h, 0x200) == 0);
+                u64 exefs_off = off + (u64) h->offset_exefs * NCCH_MEDIA_UNIT;
+                if (ok && (h->flags[7] & 0x04) && h->size_exefs && (exefs_off + 0x200 <= fsize))
+                    ok = (ref_read_at(ref, exefs_off, ref->exefs[i], 0x200) == 0);
+            }
         }
         if (!ok) ShowPrompt(false, "%s\nNot a valid .3ds or .crh file.", pathstr);
     }
@@ -299,6 +334,7 @@ u32 FixCartWithReference(const char* cart_path) {
     CartRefList list;
     list.s = NULL;
     RefCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
     bool cart_open = false;
 
     if (ncsd_cart.mediaId != ref->ncsd.mediaId) {
@@ -317,7 +353,9 @@ u32 FixCartWithReference(const char* cart_path) {
     char partinfo[512];
     char* pw = partinfo;
     *pw = '\0';
-    u8 hdr_cart[0x200];
+    u8 hdr_cart[0x200] __attribute__((aligned(16)));
+    u8 hdr_norm[0x200];
+    u32 n_decrypt = 0;
     for (u32 i = 0; i < 8; i++) {
         NcchPartition* pc = ncsd_cart.partitions + i;
         NcchPartition* pr = ref->ncsd.partitions + i;
@@ -327,21 +365,46 @@ u32 FixCartWithReference(const char* cart_path) {
         bool match = (pc->offset == pr->offset) && (pc->size == pr->size) &&
             (offset + size <= ref_size) && (offset + size <= cart_size);
         u32 diff = 0;
+        bool decrypt = false;
+        const NcchHeader* rh = (const NcchHeader*) (const void*) ref->ncch[i];
+        const NcchHeader* ch = (const NcchHeader*) (const void*) hdr_cart;
         if (match) {
             if (FileGetData(cart_path, hdr_cart, 0x200, offset) != 0x200) {
                 ShowPrompt(false, "Cannot read partition %lu header.", i);
                 goto done;
             }
-            diff = count_diff(hdr_cart, ref->ncch[i], 0x200);
+            // compare headers ignoring the crypto flags (a decrypted dump only differs there)
+            memcpy(hdr_norm, hdr_cart, 0x200);
+            hdr_norm[0x188 + 3] = ref->ncch[i][0x188 + 3];
+            hdr_norm[0x188 + 7] = ref->ncch[i][0x188 + 7];
+            diff = count_diff(hdr_norm, ref->ncch[i], 0x200);
             match = (diff <= REF_HDR_TOLERANCE);
+            bool ref_plain = (rh->flags[7] & 0x04) != 0;
+            bool cart_plain = (ch->flags[7] & 0x04) != 0;
+            if (match && ref_plain && !cart_plain) decrypt = true;
+            else if (match && !ref_plain && cart_plain) match = false; // unexpected: decrypted cart
         }
         if (match) {
-            ranges[n_ranges].start = (u32) (offset / CARTREF_SECTOR);
-            ranges[n_ranges].count = (u32) (size / CARTREF_SECTOR);
+            RefPart* part = ctx.parts + ctx.n_parts++;
+            part->start = (u32) (offset / CARTREF_SECTOR);
+            part->count = (u32) (size / CARTREF_SECTOR);
+            part->decrypt = decrypt;
+            if (decrypt) {
+                // reference header (undamaged) with the cartridge's crypto flags
+                memcpy(&part->ncch, ref->ncch[i], 0x200);
+                part->ncch.flags[3] = ch->flags[3];
+                part->ncch.flags[7] = ch->flags[7];
+                part->has_exefs = (rh->size_exefs != 0);
+                memcpy(&part->exefs, ref->exefs[i], 0x200);
+                n_decrypt++;
+            }
+            ranges[n_ranges].start = part->start;
+            ranges[n_ranges].count = part->count;
             n_ranges++;
         } else n_unmatched++;
-        pw += snprintf(pw, partinfo + sizeof(partinfo) - pw, "Content%lu: %s%s\n", i,
-            match ? "match" : "DIFFERENT (skipped)", (match && diff) ? " (header damaged)" : "");
+        pw += snprintf(pw, partinfo + sizeof(partinfo) - pw, "Content%lu: %s%s%s\n", i,
+            match ? "match" : "DIFFERENT (skipped)", decrypt ? " (decrypted ref)" : "",
+            (match && diff) ? " (header damaged)" : "");
     }
 
     if (!n_ranges) {
@@ -402,6 +465,24 @@ u32 FixCartWithReference(const char* cart_path) {
     }
     cart_open = true;
     ctx.ref = ref;
+    ctx.scratch = (u8*) malloc((size_t) CARTREF_SCAN_CHUNK * CARTREF_SECTOR);
+    if (!ctx.scratch) {
+        ShowPrompt(false, "Out of memory.");
+        goto done;
+    }
+    if (n_decrypt) {
+        // make sure the cartridge can actually be decrypted here (keys available)
+        u8 test[CARTREF_SECTOR];
+        u8 m = 0;
+        u32 tsec = 0;
+        for (u32 p = 0; p < ctx.n_parts; p++)
+            if (ctx.parts[p].decrypt) { tsec = ctx.parts[p].start + 1; break; }
+        if ((io_cart_read(&ctx, tsec, 1, test, false) != 0) ||
+            (io_ref_compare(&ctx, tsec, 1, test, &m) != 0)) {
+            ShowPrompt(false, "Cannot decrypt the cartridge data\nfor comparison with a decrypted\nreference. Use an encrypted dump.");
+            goto done;
+        }
+    }
     ctx.status_timer = ctx.run_timer = timer_start();
 
     CartRefIo io = { &ctx, io_cart_read, io_ref_compare, io_begin_pass, io_poll_abort, io_poll_skip, io_status };
@@ -421,6 +502,16 @@ u32 FixCartWithReference(const char* cart_path) {
                 n_unmatched ? "\n \nOther partitions were not checked;\nuse \"Fix cartridge corruption\"." : "");
             ret = 0;
             goto done;
+        }
+        u64 total_sectors = 0;
+        for (u32 r = 0; r < n_ranges; r++) total_sectors += ranges[r].count;
+        if ((res == CARTREF_OK) && (list.overflow || ((u64) list.count * 4 > total_sectors))) {
+            // a quarter or more of everything differs: almost certainly a wrong reference
+            if (!ShowPrompt(true, "%lu%s of %llu sectors differ.\n \nThis looks like a reference that does\nnot match the cartridge (other version\nor region, or a bad dump), not like\ncorruption.\n \nRepair anyway?",
+                    list.count, list.overflow ? "+" : "", (unsigned long long) total_sectors)) {
+                res = CARTREF_ABORTED;
+                list.count = 0; // nothing worth saving
+            }
         }
         if ((res == CARTREF_OK) && list.overflow)
             ShowPrompt(false, "More than %lu bad sectors.\nThe first %lu will be fixed now;\nrun this again afterwards.",
@@ -468,9 +559,9 @@ u32 FixCartWithReference(const char* cart_path) {
     write_report(cart_path, ref_path, &list, partinfo, res);
 
     const char* why =
-        (res == CARTREF_ABORTED)    ? "Paused." :
+        (res == CARTREF_ABORTED)    ? "Stopped." :
         (res == CARTREF_CART_ERROR) ? "Cartridge stopped responding.\nReseat it and run this again." :
-        (res == CARTREF_REF_ERROR)  ? "Cannot read the reference file." :
+        (res == CARTREF_REF_ERROR)  ? "Cannot read the reference file\nor decrypt the cartridge data." :
         (res == CARTREF_NO_MEMORY)  ? "Out of memory." : "Finished.";
     ShowPrompt(false, "%s\n \nFixed: %lu\nUnfixable: %lu\nSkipped: %lu\nRemaining: %lu\n \n%s%s",
         why, st.fixed, st.unfixable, st.skipped, st.pending,
@@ -480,6 +571,7 @@ u32 FixCartWithReference(const char* cart_path) {
 
 done:
     if (cart_open) fvx_close(&ctx.cart);
+    free(ctx.scratch);
     if (list.s) CartRef_ListFree(&list);
     ref_close(ref);
     return ret;

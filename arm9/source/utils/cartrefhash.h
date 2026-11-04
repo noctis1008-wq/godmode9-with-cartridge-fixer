@@ -5,27 +5,33 @@
 // All values little-endian.
 //
 //   0x0000  char[4]  magic "CRH1"
-//   0x0004  u32      version (1)
+//   0x0004  u32      version (2)
 //   0x0008  u32      hash size in bytes (8)
-//   0x000C  u32      offset of the hash table (0x1400)
+//   0x000C  u32      offset of the hash table (0x2400)
 //   0x0010  u64      title ID (NCSD media ID)
 //   0x0018  u64      size of the source .3ds in bytes
 //   0x0020  u32      number of sectors (size / 0x200)
 //   0x0024  ...      zero up to 0x200
 //   0x0200  0x200    copy of the NCSD header (image offset 0)
 //   0x0400  8*0x200  copy of each partition's NCCH header (zeros if absent)
-//   0x1400  ...      per sector: first `hash size` bytes of SHA-256(sector)
+//   0x1400  8*0x200  each partition's ExeFS header, decrypted (zeros if absent
+//                    or if the source partition is encrypted)
+//   0x2400  ...      per sector: first `hash size` bytes of SHA-256(sector)
+//
+// The hashes are of the image as it is: if the source .3ds is decrypted, so are
+// the hashes, and GodMode9 decrypts the cartridge data before comparing.
 //
 // The file is about 1/64 of the image size.
 
 #include <stdint.h>
 
 #define CRH_MAGIC        "CRH1"
-#define CRH_VERSION      1u
+#define CRH_VERSION      2u
 #define CRH_HASH_SIZE    8u
-#define CRH_TABLE_OFFSET 0x1400u
+#define CRH_TABLE_OFFSET 0x2400u
 #define CRH_NCSD_OFFSET  0x200u
 #define CRH_NCCH_OFFSET  0x400u
+#define CRH_EXEFS_OFFSET 0x1400u
 
 typedef struct {
     char     magic[4];
