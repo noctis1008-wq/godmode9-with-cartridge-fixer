@@ -38,7 +38,10 @@ jobs:
         run: |
           ZIPNAME=$(ls GodMode9-*.zip)
           rm $ZIPNAME
-          echo "OUTNAME=${ZIPNAME%.zip}" >> $GITHUB_ENV
+          # ship the firm under its own name so it can sit next to the stock GodMode9 in luma/payloads
+          mv GodMode9.firm GodMode9_RefFix.firm
+          mv GodMode9.firm.sha GodMode9_RefFix.firm.sha
+          echo "OUTNAME=GodMode9_RefFix-${ZIPNAME#GodMode9-}" | sed 's/\.zip$//' >> $GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
