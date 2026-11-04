@@ -131,8 +131,9 @@ If verification persistently fails, and fixed chunk/unfixable chunk plateaus, **
 If you have a **verified .3ds of the same game and version** (it does not have to come from the same cartridge), you can use it as a reference:
 
 1. Copy the reference `.3ds` anywhere on the SD card.
+   - Not enough space on the SD card? Create a small **hash file** on a PC instead (about 1/64 of the image size) and copy that: `python3 tools/make_crh.py game.3ds` → `game.crh`. It works the same way.
 2. In `[C:] GAMECART`, press A on the `.3ds` file, then choose **Fix with reference image**.
-3. Select the reference file. Each partition is checked: only partitions whose layout and NCCH header match the cartridge are used (a different update partition is skipped and reported).
+3. Select the reference file (`.3ds` or `.crh`). Each partition is checked: only partitions whose layout and NCCH header match the cartridge are used (a different update partition is skipped and reported).
 4. Optionally verify the reference first (recommended).
 5. The cartridge is compared with the reference sector by sector (0x200 bytes). Only the sectors that differ are re-read with the refresh command, round-robin, until each one reads correctly 5 times in a row without refresh.
 

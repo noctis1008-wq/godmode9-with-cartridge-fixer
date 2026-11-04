@@ -52,9 +52,12 @@ static int m_cart_read(void* ctx, uint32_t sector, uint32_t count, void* buf, bo
     return 0;
 }
 
-static int m_ref_read(void* ctx, uint32_t sector, uint32_t count, void* buf) {
+static int m_ref_compare(void* ctx, uint32_t sector, uint32_t count, const void* cart_buf, uint8_t* match) {
     Mock* m = ctx;
-    memcpy(buf, m->ref + (size_t) sector * CARTREF_SECTOR, (size_t) count * CARTREF_SECTOR);
+    const uint8_t* c = cart_buf;
+    for (uint32_t i = 0; i < count; i++)
+        match[i] = memcmp(c + (size_t) i * CARTREF_SECTOR, m->ref + (size_t) (sector + i) * CARTREF_SECTOR,
+                          CARTREF_SECTOR) == 0;
     return 0;
 }
 
@@ -78,7 +81,7 @@ static Mock* new_mock(void) {
 static void free_mock(Mock* m) { free(m->ref); free(m); }
 
 static CartRefIo io_for(Mock* m) {
-    CartRefIo io = { m, m_cart_read, m_ref_read, m_begin_pass, m_abort, NULL, NULL };
+    CartRefIo io = { m, m_cart_read, m_ref_compare, m_begin_pass, m_abort, NULL, NULL };
     return io;
 }
 
@@ -101,7 +104,7 @@ static void test_scan_and_repair(void) {
     CartRefRange ranges[2] = { { 64, 3000 }, { 3064, NSECT - 3064 } }; // 3000 is in range 1? 64+3000=3064 -> yes, 3000 < 3064
     CartRefList l;
     CHECK(CartRef_ListInit(&l, 1000));
-    uint8_t* buf = malloc(2 * CARTREF_SCAN_CHUNK * CARTREF_SECTOR);
+    uint8_t* buf = malloc((size_t) CARTREF_SCAN_CHUNK * (CARTREF_SECTOR + 1));
     CHECK(CartRef_Scan(&io, ranges, 2, &l, buf) == CARTREF_OK);
     CHECK(l.count == 6);
     CHECK(find(&l, 50) == NULL);
@@ -165,7 +168,7 @@ static void test_read_errors(void) {
     m->fail_next = 1000; // dead cart
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_CART_ERROR);
 
-    uint8_t* buf = malloc(2 * CARTREF_SCAN_CHUNK * CARTREF_SECTOR);
+    uint8_t* buf = malloc((size_t) CARTREF_SCAN_CHUNK * (CARTREF_SECTOR + 1));
     CartRefRange r = { 0, 100 };
     CartRefList l2;
     CartRef_ListInit(&l2, 10);
@@ -225,7 +228,7 @@ static void test_overflow(void) {
     CartRefIo io = io_for(m);
     CartRefList l;
     CartRef_ListInit(&l, 5);
-    uint8_t* buf = malloc(2 * CARTREF_SCAN_CHUNK * CARTREF_SECTOR);
+    uint8_t* buf = malloc((size_t) CARTREF_SCAN_CHUNK * (CARTREF_SECTOR + 1));
     CartRefRange r = { 0, 100 };
     CHECK(CartRef_Scan(&io, &r, 1, &l, buf) == CARTREF_OK);
     CHECK(l.count == 5 && l.overflow);

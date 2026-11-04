@@ -74,8 +74,10 @@ typedef struct {
     // Read `count` sectors from the cartridge. With `refresh` set, the refresh
     // command is sent before the read. Returns 0 on success.
     int  (*cart_read)(void* ctx, uint32_t sector, uint32_t count, void* buf, bool refresh);
-    // Read `count` sectors from the reference image. Returns 0 on success.
-    int  (*ref_read)(void* ctx, uint32_t sector, uint32_t count, void* buf);
+    // Check `count` sectors of cartridge data (starting at `sector`) against
+    // the reference (a full image or a per-sector hash list). Sets match[i] to
+    // 1 for every sector that is correct, 0 otherwise. Returns 0 on success.
+    int  (*ref_compare)(void* ctx, uint32_t sector, uint32_t count, const void* cart_buf, uint8_t* match);
     // Called once per repair pass (lets the fault simulator advance).
     void (*begin_pass)(void* ctx);
     // Return true to stop (user pressed B).
@@ -102,7 +104,8 @@ bool CartRef_ListAdd(CartRefList* l, uint32_t sector);
 void CartRef_Count(const CartRefList* l, CartRefStatus* st);
 
 // Compare the given ranges of cartridge and reference, adding every differing
-// sector to `list`. `buf` must hold 2 * CARTREF_SCAN_CHUNK sectors.
+// sector to `list`. `buf` must hold CARTREF_SCAN_CHUNK sectors plus
+// CARTREF_SCAN_CHUNK bytes (match flags).
 CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint32_t n_ranges,
                            CartRefList* list, uint8_t* buf);
 

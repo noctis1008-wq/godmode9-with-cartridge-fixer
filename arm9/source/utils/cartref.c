@@ -70,7 +70,7 @@ static void report(const CartRefIo* io, const CartRefStatus* st) {
 CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint32_t n_ranges,
                            CartRefList* list, uint8_t* buf) {
     uint8_t* cbuf = buf;
-    uint8_t* rbuf = buf + (size_t) CARTREF_SCAN_CHUNK * CARTREF_SECTOR;
+    uint8_t* match = buf + (size_t) CARTREF_SCAN_CHUNK * CARTREF_SECTOR;
 
     CartRefStatus st;
     memset(&st, 0, sizeof(st));
@@ -92,12 +92,11 @@ CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint
                 if (++fails >= CARTREF_MAX_READ_FAILS)
                     return CARTREF_CART_ERROR;
             }
-            if (io->ref_read(io->ctx, sector, n, rbuf) != 0)
+            if (io->ref_compare(io->ctx, sector, n, cbuf, match) != 0)
                 return CARTREF_REF_ERROR;
 
             for (uint32_t i = 0; i < n; i++) {
-                size_t o = (size_t) i * CARTREF_SECTOR;
-                if (memcmp(cbuf + o, rbuf + o, CARTREF_SECTOR) != 0) {
+                if (!match[i]) {
                     if (!CartRef_ListAdd(list, sector + i))
                         return CARTREF_OK; // list full: work on what we have
                 }
@@ -113,7 +112,6 @@ CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint
 
 CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRefList* list) {
     uint8_t cbuf[CARTREF_SECTOR];
-    uint8_t rbuf[CARTREF_SECTOR];
     uint32_t apv = p->attempts_per_visit ? p->attempts_per_visit : 1;
     int read_fails = 0;
 
@@ -137,9 +135,6 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
 
             if (io->poll_abort && io->poll_abort(io->ctx))
                 return CARTREF_ABORTED;
-            if (io->ref_read(io->ctx, s->sector, 1, rbuf) != 0)
-                return CARTREF_REF_ERROR;
-
             for (uint32_t a = 0; (a < apv) && (s->state == CARTREF_PENDING); a++) {
                 if (io->cart_read(io->ctx, s->sector, 1, cbuf, true) != 0) {
                     if (++read_fails >= CARTREF_MAX_READ_FAILS) return CARTREF_CART_ERROR;
@@ -149,7 +144,10 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                 s->attempts++;
                 st.total_attempts++;
 
-                bool match = (memcmp(cbuf, rbuf, CARTREF_SECTOR) == 0);
+                uint8_t m = 0;
+                if (io->ref_compare(io->ctx, s->sector, 1, cbuf, &m) != 0)
+                    return CARTREF_REF_ERROR;
+                bool match = (m != 0);
                 if (match) {
                     // Make sure it stays correct on plain reads (no refresh).
                     for (uint32_t c = 0; c < p->confirm_reads; c++) {
@@ -159,7 +157,9 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                             break;
                         }
                         read_fails = 0;
-                        if (memcmp(cbuf, rbuf, CARTREF_SECTOR) != 0) {
+                        if (io->ref_compare(io->ctx, s->sector, 1, cbuf, &m) != 0)
+                            return CARTREF_REF_ERROR;
+                        if (!m) {
                             match = false;
                             break;
                         }

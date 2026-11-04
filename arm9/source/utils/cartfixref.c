@@ -3,6 +3,8 @@
 
 #include "cartfixref.h"
 #include "cartref.h"
+#include "cartrefhash.h"
+#include "sha.h"
 #include "gameutil.h"
 #include "fsutil.h"
 #include "game.h"
@@ -25,9 +27,23 @@
 extern bool force_refresh;                       // command_ctr.c: refresh before every read
 u32 LoadNcsdHeader(NcsdHeader* ncsd, const char* path); // gameutil.c
 
+// The reference: either a full .3ds image or a .crh hash list.
+typedef struct {
+    bool is_hash;
+    FIL file;
+    NcsdHeader ncsd;
+    u8 ncch[8][0x200];        // each partition's NCCH header
+    u64 image_size;
+    u32 table_offset;         // hash list only
+    u8* chunk;                // reference data / hashes for one scan chunk
+    u32 cache_sector;         // single-sector cache for the repair phase
+    bool cache_valid;
+    u8 cache[CARTREF_SECTOR];
+} RefSource;
+
 typedef struct {
     FIL cart;
-    FIL ref;
+    RefSource* ref;
     u64 status_timer;
     u64 run_timer;
 } RefCtx;
@@ -45,13 +61,117 @@ static int io_cart_read(void* vctx, u32 sector, u32 count, void* buf, bool refre
     return ((fr != FR_OK) || (br != size)) ? 1 : 0;
 }
 
-static int io_ref_read(void* vctx, u32 sector, u32 count, void* buf) {
-    RefCtx* ctx = (RefCtx*) vctx;
-    UINT size = count * CARTREF_SECTOR;
+static int ref_read_at(RefSource* ref, u64 offset, void* buf, UINT size) {
     UINT br = 0;
-    if (fvx_lseek(&ctx->ref, (u64) sector * CARTREF_SECTOR) != FR_OK) return 1;
-    if ((fvx_read(&ctx->ref, buf, size, &br) != FR_OK) || (br != size)) return 1;
+    if (fvx_lseek(&ref->file, offset) != FR_OK) return 1;
+    if ((fvx_read(&ref->file, buf, size, &br) != FR_OK) || (br != size)) return 1;
     return 0;
+}
+
+// Reference bytes for `count` sectors: image data, or `CRH_HASH_SIZE` bytes per sector.
+static int ref_load(RefSource* ref, u32 sector, u32 count, u8* out) {
+    if (ref->is_hash)
+        return ref_read_at(ref, ref->table_offset + (u64) sector * CRH_HASH_SIZE, out, count * CRH_HASH_SIZE);
+    return ref_read_at(ref, (u64) sector * CARTREF_SECTOR, out, count * CARTREF_SECTOR);
+}
+
+static bool ref_match_one(RefSource* ref, const u8* cart, const u8* refdata) {
+    if (ref->is_hash) {
+        u8 sha[32];
+        sha_quick(sha, cart, CARTREF_SECTOR, SHA256_MODE);
+        return memcmp(sha, refdata, CRH_HASH_SIZE) == 0;
+    }
+    return memcmp(cart, refdata, CARTREF_SECTOR) == 0;
+}
+
+static int io_ref_compare(void* vctx, u32 sector, u32 count, const void* cart_buf, u8* match) {
+    RefSource* ref = ((RefCtx*) vctx)->ref;
+    const u8* cart = (const u8*) cart_buf;
+    u32 unit = ref->is_hash ? CRH_HASH_SIZE : CARTREF_SECTOR;
+    const u8* refdata;
+
+    if (count == 1) { // repair phase: same sector is checked many times in a row
+        if (!ref->cache_valid || (ref->cache_sector != sector)) {
+            if (ref_load(ref, sector, 1, ref->cache) != 0) return 1;
+            ref->cache_sector = sector;
+            ref->cache_valid = true;
+        }
+        refdata = ref->cache;
+    } else {
+        if (count > CARTREF_SCAN_CHUNK) return 1;
+        if (ref_load(ref, sector, count, ref->chunk) != 0) return 1;
+        refdata = ref->chunk;
+    }
+
+    for (u32 i = 0; i < count; i++)
+        match[i] = ref_match_one(ref, cart + (size_t) i * CARTREF_SECTOR, refdata + (size_t) i * unit) ? 1 : 0;
+    return 0;
+}
+
+// Open a reference (.3ds or .crh). Returns NULL and shows a message on failure.
+static RefSource* ref_open(const char* path) {
+    char pathstr[UTF_BUFFER_BYTESIZE(32)];
+    TruncateString(pathstr, path, 32, 8);
+
+    RefSource* ref = (RefSource*) malloc(sizeof(RefSource));
+    if (!ref) return NULL;
+    memset(ref, 0, sizeof(RefSource));
+    if (fvx_open(&ref->file, path, FA_READ | FA_OPEN_EXISTING) != FR_OK) {
+        free(ref);
+        ShowPrompt(false, "%s\nCannot open file.", pathstr);
+        return NULL;
+    }
+
+    u64 fsize = fvx_size(&ref->file);
+    CrhHeader crh;
+    bool ok = false;
+    if ((fsize >= CRH_TABLE_OFFSET) && (ref_read_at(ref, 0, &crh, sizeof(crh)) == 0) &&
+        (memcmp(crh.magic, CRH_MAGIC, 4) == 0)) {
+        ref->is_hash = true;
+        ok = (crh.version == CRH_VERSION) && (crh.hash_size == CRH_HASH_SIZE) &&
+            (crh.table_offset >= CRH_TABLE_OFFSET) &&
+            (crh.sector_count == crh.image_size / CARTREF_SECTOR) &&
+            (fsize == crh.table_offset + (u64) crh.sector_count * CRH_HASH_SIZE) &&
+            (ref_read_at(ref, CRH_NCSD_OFFSET, &ref->ncsd, sizeof(NcsdHeader)) == 0) &&
+            (ref_read_at(ref, CRH_NCCH_OFFSET, ref->ncch, sizeof(ref->ncch)) == 0) &&
+            (ValidateNcsdHeader(&ref->ncsd) == 0) && (ref->ncsd.mediaId == crh.title_id);
+        ref->image_size = crh.image_size;
+        ref->table_offset = crh.table_offset;
+        if (!ok) ShowPrompt(false, "%s\nInvalid or damaged .crh hash file.", pathstr);
+    } else {
+        ref->image_size = fsize;
+        ok = (ref_read_at(ref, 0, &ref->ncsd, sizeof(NcsdHeader)) == 0) &&
+            (ValidateNcsdHeader(&ref->ncsd) == 0);
+        for (u32 i = 0; ok && (i < 8); i++) {
+            NcchPartition* p = ref->ncsd.partitions + i;
+            u64 off = (u64) p->offset * NCSD_MEDIA_UNIT;
+            if (p->size && (off + 0x200 <= fsize))
+                ok = (ref_read_at(ref, off, ref->ncch[i], 0x200) == 0);
+        }
+        if (!ok) ShowPrompt(false, "%s\nNot a valid .3ds or .crh file.", pathstr);
+    }
+
+    if (ok) {
+        ref->chunk = (u8*) malloc((size_t) CARTREF_SCAN_CHUNK * (ref->is_hash ? CRH_HASH_SIZE : CARTREF_SECTOR));
+        if (!ref->chunk) {
+            ShowPrompt(false, "Out of memory.");
+            ok = false;
+        }
+    }
+    if (!ok) {
+        fvx_close(&ref->file);
+        free(ref->chunk);
+        free(ref);
+        return NULL;
+    }
+    return ref;
+}
+
+static void ref_close(RefSource* ref) {
+    if (!ref) return;
+    fvx_close(&ref->file);
+    free(ref->chunk);
+    free(ref);
 }
 
 static void io_begin_pass(void* vctx) {
@@ -160,30 +280,35 @@ u32 FixCartWithReference(const char* cart_path) {
         return 1;
     }
 
-    // pick the reference image
+    // pick the reference (.3ds image or .crh hash file)
     char ref_path[256];
-    if (!FileSelector(ref_path, "Select a verified reference .3ds\n(same game, same version)", "0:/", "*.3ds", 0, false))
+    if (!FileSelector(ref_path, "Select reference: verified .3ds\nor .crh hash file (same game/version)", "0:/", "*", 0, false))
         return 1;
     char refstr[UTF_BUFFER_BYTESIZE(32)];
     TruncateString(refstr, ref_path, 32, 8);
 
-    NcsdHeader ncsd_cart, ncsd_ref;
+    NcsdHeader ncsd_cart;
     if (LoadNcsdHeader(&ncsd_cart, cart_path) != 0) {
         ShowPrompt(false, "%s\nCannot read the cartridge header.", pathstr);
         return 1;
     }
-    if (LoadNcsdHeader(&ncsd_ref, ref_path) != 0) {
-        ShowPrompt(false, "%s\nNot a valid .3ds (NCSD) file.", refstr);
-        return 1;
-    }
-    if (ncsd_cart.mediaId != ncsd_ref.mediaId) {
+    RefSource* ref = ref_open(ref_path);
+    if (!ref) return 1;
+
+    u32 ret = 1;
+    CartRefList list;
+    list.s = NULL;
+    RefCtx ctx;
+    bool cart_open = false;
+
+    if (ncsd_cart.mediaId != ref->ncsd.mediaId) {
         ShowPrompt(false, "Different game.\n \nCart: %016llX\nRef:  %016llX",
-            (unsigned long long) ncsd_cart.mediaId, (unsigned long long) ncsd_ref.mediaId);
-        return 1;
+            (unsigned long long) ncsd_cart.mediaId, (unsigned long long) ref->ncsd.mediaId);
+        goto done;
     }
 
     u64 cart_size = fvx_qsize(cart_path);
-    u64 ref_size = fvx_qsize(ref_path);
+    u64 ref_size = ref->image_size;
 
     // match partitions: same place, same size, same NCCH header
     CartRefRange ranges[8];
@@ -191,10 +316,11 @@ u32 FixCartWithReference(const char* cart_path) {
     u32 n_unmatched = 0;
     char partinfo[512];
     char* pw = partinfo;
-    u8 hdr_cart[0x200], hdr_ref[0x200];
+    *pw = '\0';
+    u8 hdr_cart[0x200];
     for (u32 i = 0; i < 8; i++) {
         NcchPartition* pc = ncsd_cart.partitions + i;
-        NcchPartition* pr = ncsd_ref.partitions + i;
+        NcchPartition* pr = ref->ncsd.partitions + i;
         if (!pc->size) continue;
         u64 offset = (u64) pc->offset * NCSD_MEDIA_UNIT;
         u64 size = (u64) pc->size * NCSD_MEDIA_UNIT;
@@ -202,12 +328,11 @@ u32 FixCartWithReference(const char* cart_path) {
             (offset + size <= ref_size) && (offset + size <= cart_size);
         u32 diff = 0;
         if (match) {
-            if ((FileGetData(cart_path, hdr_cart, 0x200, offset) != 0x200) ||
-                (FileGetData(ref_path, hdr_ref, 0x200, offset) != 0x200)) {
+            if (FileGetData(cart_path, hdr_cart, 0x200, offset) != 0x200) {
                 ShowPrompt(false, "Cannot read partition %lu header.", i);
-                return 1;
+                goto done;
             }
-            diff = count_diff(hdr_cart, hdr_ref, 0x200);
+            diff = count_diff(hdr_cart, ref->ncch[i], 0x200);
             match = (diff <= REF_HDR_TOLERANCE);
         }
         if (match) {
@@ -221,7 +346,7 @@ u32 FixCartWithReference(const char* cart_path) {
 
     if (!n_ranges) {
         ShowPrompt(false, "%s\nNo partition matches the cartridge.\nIs it the same version/revision?", refstr);
-        return 1;
+        goto done;
     }
 
     // resume?
@@ -233,10 +358,9 @@ u32 FixCartWithReference(const char* cart_path) {
     rhdr.cart_size = cart_size;
     rhdr.ref_size = ref_size;
 
-    CartRefList list;
     if (!CartRef_ListInit(&list, REF_LIST_CAPACITY)) {
         ShowPrompt(false, "Out of memory.");
-        return 1;
+        goto done;
     }
 
     bool resumed = false;
@@ -253,15 +377,14 @@ u32 FixCartWithReference(const char* cart_path) {
     }
 
     if (!resumed) {
-        if (!ShowPrompt(true, "%s\nReference: %s\n \n%s\nStart scan?", pathstr, refstr, partinfo)) {
-            CartRef_ListFree(&list);
-            return 1;
-        }
-        if (ShowPrompt(true, "Verify the reference image first?\n(recommended, takes a few minutes)")) {
+        if (!ShowPrompt(true, "%s\nReference: %s\n(%s)\n \n%s\nStart scan?", pathstr, refstr,
+                ref->is_hash ? "hash file" : "full image", partinfo))
+            goto done;
+        if (!ref->is_hash &&
+            ShowPrompt(true, "Verify the reference image first?\n(recommended, takes a few minutes)")) {
             if (VerifyGameFile(ref_path, false) != 0) {
                 ShowPrompt(false, "%s\nReference image failed verification.\nUse a good dump.", refstr);
-                CartRef_ListFree(&list);
-                return 1;
+                goto done;
             }
         }
     }
@@ -273,23 +396,19 @@ u32 FixCartWithReference(const char* cart_path) {
     }
     FixerSim_BeginUnit(0, 0);
 
-    RefCtx ctx;
     if (fvx_open(&ctx.cart, cart_path, FA_READ | FA_OPEN_EXISTING) != FR_OK) {
-        CartRef_ListFree(&list);
-        return 1;
+        ShowPrompt(false, "%s\nCannot open the cartridge.", pathstr);
+        goto done;
     }
-    if (fvx_open(&ctx.ref, ref_path, FA_READ | FA_OPEN_EXISTING) != FR_OK) {
-        fvx_close(&ctx.cart);
-        CartRef_ListFree(&list);
-        return 1;
-    }
+    cart_open = true;
+    ctx.ref = ref;
     ctx.status_timer = ctx.run_timer = timer_start();
 
-    CartRefIo io = { &ctx, io_cart_read, io_ref_read, io_begin_pass, io_poll_abort, io_poll_skip, io_status };
+    CartRefIo io = { &ctx, io_cart_read, io_ref_compare, io_begin_pass, io_poll_abort, io_poll_skip, io_status };
     CartRefResult res = CARTREF_OK;
 
     if (!resumed) {
-        u8* buf = (u8*) malloc(2 * CARTREF_SCAN_CHUNK * CARTREF_SECTOR);
+        u8* buf = (u8*) malloc((size_t) CARTREF_SCAN_CHUNK * (CARTREF_SECTOR + 1));
         if (!buf) res = CARTREF_NO_MEMORY;
         else {
             ShowProgress(0, 0, "Scanning...");
@@ -297,13 +416,11 @@ u32 FixCartWithReference(const char* cart_path) {
             free(buf);
         }
         if ((res == CARTREF_OK) && !list.count) {
-            fvx_close(&ctx.cart);
-            fvx_close(&ctx.ref);
-            CartRef_ListFree(&list);
             fvx_unlink(spath);
             ShowPrompt(false, "%s\nNo differences found in the\nmatching partitions.%s", pathstr,
                 n_unmatched ? "\n \nOther partitions were not checked;\nuse \"Fix cartridge corruption\"." : "");
-            return 0;
+            ret = 0;
+            goto done;
         }
         if ((res == CARTREF_OK) && list.overflow)
             ShowPrompt(false, "More than %lu bad sectors.\nThe first %lu will be fixed now;\nrun this again afterwards.",
@@ -327,7 +444,7 @@ u32 FixCartWithReference(const char* cart_path) {
     }
 
     fvx_close(&ctx.cart);
-    fvx_close(&ctx.ref);
+    cart_open = false;
 
     // make sure the SD card is usable (the user may have swapped it while paused)
     while (!InitSDCardFS()) {
@@ -353,13 +470,17 @@ u32 FixCartWithReference(const char* cart_path) {
     const char* why =
         (res == CARTREF_ABORTED)    ? "Paused." :
         (res == CARTREF_CART_ERROR) ? "Cartridge stopped responding.\nReseat it and run this again." :
-        (res == CARTREF_REF_ERROR)  ? "Cannot read the reference image." :
+        (res == CARTREF_REF_ERROR)  ? "Cannot read the reference file." :
         (res == CARTREF_NO_MEMORY)  ? "Out of memory." : "Finished.";
     ShowPrompt(false, "%s\n \nFixed: %lu\nUnfixable: %lu\nSkipped: %lu\nRemaining: %lu\n \n%s%s",
         why, st.fixed, st.unfixable, st.skipped, st.pending,
         saved ? "Progress saved - run again to continue.\n" : "",
         (res == CARTREF_OK && !st.unfixable && !st.skipped) ? "Run Verify to confirm." : "");
+    ret = (res == CARTREF_OK) ? 0 : 1;
 
-    CartRef_ListFree(&list);
-    return (res == CARTREF_OK) ? 0 : 1;
+done:
+    if (cart_open) fvx_close(&ctx.cart);
+    if (list.s) CartRef_ListFree(&list);
+    ref_close(ref);
+    return ret;
 }
