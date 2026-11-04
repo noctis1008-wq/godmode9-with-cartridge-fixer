@@ -21,6 +21,7 @@
 #define REF_LIST_CAPACITY   (256u * 1024u)       // max. bad sectors tracked per run (128 MB of data)
 #define REF_HDR_TOLERANCE   32                   // differing bytes allowed in a damaged NCCH header
 #define REF_STATUS_MS       150
+#define REF_HASH_DIR        "0:/luma/payloads/hash"
 #define REF_REPORT_SIZE     STD_BUFFER_SIZE
 #define REF_REPORT_MAX_LINES 20000
 
@@ -317,7 +318,10 @@ u32 FixCartWithReference(const char* cart_path) {
 
     // pick the reference (.3ds image or .crh hash file)
     char ref_path[256];
-    if (!FileSelector(ref_path, "Select reference: verified .3ds\nor .crh hash file (same game/version)", "0:/", "*", 0, false))
+    // start in luma/payloads/hash/ if it exists, otherwise at the SD root
+    FILINFO fno;
+    const char* ref_dir = ((fvx_stat(REF_HASH_DIR, &fno) == FR_OK) && (fno.fattrib & AM_DIR)) ? REF_HASH_DIR : "0:/";
+    if (!FileSelector(ref_path, "Select reference: verified .3ds\nor .crh hash file (same game/version)", ref_dir, "*", 0, false))
         return 1;
     char refstr[UTF_BUFFER_BYTESIZE(32)];
     TruncateString(refstr, ref_path, 32, 8);
