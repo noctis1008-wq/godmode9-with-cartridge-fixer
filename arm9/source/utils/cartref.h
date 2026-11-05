@@ -17,6 +17,7 @@
 
 #define CARTREF_SECTOR      0x200u
 #define CARTREF_SCAN_CHUNK  0x800u   // sectors per scan read (1 MB)
+#define CARTREF_RUN_MAX     4u       // neighbouring bad sectors handled by one refresh + read
 
 typedef enum {
     CARTREF_PENDING = 0,

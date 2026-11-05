@@ -124,8 +124,16 @@ CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint
     return CARTREF_OK;
 }
 
+/* One repair attempt on `n` neighbouring sectors list->s[first..first+n): a
+ * single refresh + read covers them all. The card's error correction works on
+ * blocks of about 1 KB, and real logs show bad sectors in adjacent pairs that
+ * recover together, so one command for the run gives each sector the same
+ * chance at a fraction of the commands. */
 CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRefList* list) {
-    uint8_t cbuf[CARTREF_SECTOR];
+    static uint8_t cbuf[CARTREF_RUN_MAX * CARTREF_SECTOR]; /* the refreshed read (static: keep it off the small ARM9 stack) */
+    static uint8_t vbuf[CARTREF_RUN_MAX * CARTREF_SECTOR]; /* confirmation reads */
+    uint8_t m[CARTREF_RUN_MAX];
+    uint8_t cand[CARTREF_RUN_MAX];
     uint32_t apv = p->attempts_per_visit ? p->attempts_per_visit : 1;
     int read_fails = 0;
 
@@ -143,68 +151,95 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
         st.pass++;
         if (io->begin_pass) io->begin_pass(io->ctx);
 
-        for (uint32_t i = 0; i < list->count; i++) {
-            CartRefSector* s = &list->s[i];
-            if (s->state != CARTREF_PENDING) continue;
+        uint32_t i = 0;
+        while (i < list->count) {
+            if (list->s[i].state != CARTREF_PENDING) {
+                i++;
+                continue;
+            }
+            /* the run: following PENDING entries with consecutive sector numbers */
+            uint32_t n = 1;
+            while ((n < CARTREF_RUN_MAX) && (i + n < list->count) &&
+                   (list->s[i + n].state == CARTREF_PENDING) &&
+                   (list->s[i + n].sector == list->s[i].sector + n))
+                n++;
+            CartRefSector* run = &list->s[i];
+            uint32_t first = run[0].sector;
 
             if (io->poll_abort && io->poll_abort(io->ctx))
                 return CARTREF_ABORTED;
-            for (uint32_t a = 0; (a < apv) && (s->state == CARTREF_PENDING); a++) {
-                if (io->cart_read(io->ctx, s->sector, 1, cbuf, true) != 0) {
+
+            for (uint32_t a = 0; a < apv; a++) {
+                uint32_t open = 0;
+                for (uint32_t k = 0; k < n; k++)
+                    open += (run[k].state == CARTREF_PENDING);
+                if (!open) break;
+
+                if (io->cart_read(io->ctx, first, n, cbuf, true) != 0) {
                     if (++read_fails >= CARTREF_MAX_READ_FAILS) return CARTREF_CART_ERROR;
                     continue;
                 }
                 read_fails = 0;
-                s->attempts++;
                 st.total_attempts++;
-
-                uint8_t m = 0;
-                if (io->ref_compare(io->ctx, s->sector, 1, cbuf, &m) != 0)
+                if (io->ref_compare(io->ctx, first, n, cbuf, m) != 0)
                     return CARTREF_REF_ERROR;
-                bool match = (m != 0);
-                if (match) {
-                    // Make sure it stays correct on plain reads (no refresh).
-                    for (uint32_t c = 0; c < p->confirm_reads; c++) {
-                        if (io->cart_read(io->ctx, s->sector, 1, cbuf, false) != 0) {
-                            if (++read_fails >= CARTREF_MAX_READ_FAILS) return CARTREF_CART_ERROR;
-                            match = false;
-                            break;
-                        }
-                        read_fails = 0;
-                        if (io->ref_compare(io->ctx, s->sector, 1, cbuf, &m) != 0)
-                            return CARTREF_REF_ERROR;
-                        if (!m) {
-                            match = false;
-                            break;
-                        }
-                    }
-                    if (match) {
-                        s->state = CARTREF_FIXED;
+
+                /* matches get confirmed with plain reads (no refresh) */
+                uint32_t ncand = 0;
+                for (uint32_t k = 0; k < n; k++) {
+                    cand[k] = (run[k].state == CARTREF_PENDING) && m[k];
+                    ncand += cand[k];
+                }
+                bool readerr = false;
+                for (uint32_t c = 0; ncand && (c < p->confirm_reads); c++) {
+                    if (io->cart_read(io->ctx, first, n, vbuf, false) != 0) {
+                        if (++read_fails >= CARTREF_MAX_READ_FAILS) return CARTREF_CART_ERROR;
+                        readerr = true;
                         break;
                     }
-                    if (read_fails) continue; // read error: no data to judge
+                    read_fails = 0;
+                    uint8_t mv[CARTREF_RUN_MAX];
+                    if (io->ref_compare(io->ctx, first, n, vbuf, mv) != 0)
+                        return CARTREF_REF_ERROR;
+                    for (uint32_t k = 0; k < n; k++) {
+                        if (cand[k] && !mv[k]) {
+                            cand[k] = 0;
+                            ncand--;
+                        }
+                    }
                 }
 
-                uint32_t sum = sector_sum(cbuf);
-                if ((s->attempts > 1) && (sum == s->last_sum)) {
-                    s->stuck++;
-                } else {
-                    s->stuck = 0;
-                    s->last_sum = sum;
-                }
-
-                if (p->stuck_limit && (s->stuck >= p->stuck_limit)) {
-                    s->state = CARTREF_UNFIXABLE;
-                } else if (s->attempts >= p->retries_before_skip) {
-                    if (p->autoskip || (io->poll_skip && io->poll_skip(io->ctx)))
-                        s->state = CARTREF_SKIPPED;
+                for (uint32_t k = 0; k < n; k++) {
+                    CartRefSector* s = &run[k];
+                    if (s->state != CARTREF_PENDING) continue;
+                    s->attempts++;
+                    if (cand[k] && !readerr) {
+                        s->state = CARTREF_FIXED;
+                        continue;
+                    }
+                    if (!m[k]) { /* a match that did not hold is no evidence of being stuck */
+                        uint32_t sum = sector_sum(&cbuf[(size_t) k * CARTREF_SECTOR]);
+                        if ((s->attempts > 1) && (sum == s->last_sum)) {
+                            s->stuck++;
+                        } else {
+                            s->stuck = 0;
+                            s->last_sum = sum;
+                        }
+                    }
+                    if (p->stuck_limit && (s->stuck >= p->stuck_limit)) {
+                        s->state = CARTREF_UNFIXABLE;
+                    } else if (s->attempts >= p->retries_before_skip) {
+                        if (p->autoskip || (io->poll_skip && io->poll_skip(io->ctx)))
+                            s->state = CARTREF_SKIPPED;
+                    }
                 }
             }
 
-            st.current_sector = s->sector;
-            st.current_attempts = s->attempts;
+            st.current_sector = first;
+            st.current_attempts = run[0].attempts;
             CartRef_Count(list, &st);
             report(io, &st);
+            i += n;
         }
 
         CartRef_Count(list, &st);

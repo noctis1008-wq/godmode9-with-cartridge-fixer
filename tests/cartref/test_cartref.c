@@ -145,6 +145,29 @@ static void test_scan_and_repair(void) {
     free_mock(m);
 }
 
+static void test_runs_share_commands(void)
+{
+    /* four adjacent sectors that each need 10 refreshes: one refresh + read
+     * covers all four, so about 10 refreshing commands instead of 40 */
+    Mock* m = new_mock();
+    uint32_t s;
+    for (s = 500; s < 504; s++) { m->fault[s] = RECOVER; m->need[s] = 10; }
+    m->fault[600] = RECOVER; m->need[600] = 3; /* a separate run */
+    CartRefIo io = io_for(m);
+    CartRefList l;
+    CartRef_ListInit(&l, 10);
+    for (s = 500; s < 504; s++) CartRef_ListAdd(&l, s);
+    CartRef_ListAdd(&l, 600);
+    CartRefParams p;
+    CartRef_DefaultParams(&p);
+    CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
+    for (s = 0; s < 5; s++) CHECK(l.s[s].state == CARTREF_FIXED);
+    printf("runs: %u refreshing commands for 5 sectors\n", m->refreshes);
+    CHECK(m->refreshes <= 14);
+    CartRef_ListFree(&l);
+    free_mock(m);
+}
+
 static void test_noise_not_stuck(void) {
     // Data that keeps changing is never "stuck": only the retry limit ends it.
     Mock* m = new_mock();
@@ -251,6 +274,7 @@ static void test_overflow(void) {
 
 int main(void) {
     test_scan_and_repair();
+    test_runs_share_commands();
     test_noise_not_stuck();
     test_read_errors();
     test_abort_and_resume();

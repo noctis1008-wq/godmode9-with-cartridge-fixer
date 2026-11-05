@@ -49,9 +49,10 @@ typedef struct {
     u64 image_size;
     u32 table_offset;         // hash list only
     u8* chunk;                // reference data / hashes for one scan chunk
-    u32 cache_sector;         // single-sector cache for the repair phase
+    u32 cache_sector;         // small cache for the repair phase (one run)
+    u32 cache_count;
     bool cache_valid;
-    u8 cache[CARTREF_SECTOR];
+    u8 cache[CARTREF_RUN_MAX * CARTREF_SECTOR];
 } RefSource;
 
 // One cartridge partition that is compared against the reference.
@@ -322,8 +323,14 @@ static int io_ref_compare(void* vctx, u32 sector, u32 count, const void* cart_bu
     for (u32 p = 0; p < ctx->n_parts; p++) {
         RefPart* part = ctx->parts + p;
         if ((sector < part->start) || (sector >= part->start + part->count)) continue;
+        if (sector + count > part->start + part->count) {
+            // a repair run that crosses into the next partition: one sector at a time
+            for (u32 i = 0; i < count; i++)
+                if (io_ref_compare(vctx, sector + i, 1, cart + (size_t) i * CARTREF_SECTOR, match + i) != 0)
+                    return 1;
+            return 0;
+        }
         if (!part->decrypt) break;
-        if (sector + count > part->start + part->count) return 1; // never spans partitions
         memcpy(ctx->scratch, cart, (size_t) count * CARTREF_SECTOR);
         if (CryptNcch(ctx->scratch, (sector - part->start) * CARTREF_SECTOR, count * CARTREF_SECTOR,
                 &part->ncch, part->has_exefs ? &part->exefs : NULL, NCCH_NOCRYPTO) != 0)
@@ -334,11 +341,12 @@ static int io_ref_compare(void* vctx, u32 sector, u32 count, const void* cart_bu
     u32 unit = ref->is_hash ? CRH_HASH_SIZE : CARTREF_SECTOR;
     const u8* refdata;
 
-    if (count == 1) { // repair phase: same sector is checked many times in a row
-        if (!ref->cache_valid || (ref->cache_sector != sector)) {
-            if (ref_load(ref, sector, 1, ref->cache) != 0) return 1;
+    if (count <= CARTREF_RUN_MAX) { // repair phase: the same run is checked many times in a row
+        if (!ref->cache_valid || (ref->cache_sector != sector) || (ref->cache_count != count)) {
+            if (ref_load(ref, sector, count, ref->cache) != 0) return 1;
             ref->cache_sector = sector;
-            ref->cache_valid = true;
+            ref->cache_count  = count;
+            ref->cache_valid  = true;
         }
         refdata = ref->cache;
     } else {
