@@ -25,7 +25,9 @@
 #define REF_STATUS_MS       150
 #define REF_HASH_DIR        "0:/luma/payloads/hash"
 #define REF_LOG_DIR         "0:/luma/payloads/log"
-#define REF_LOG_EVENTS_SIZE (256u * 1024u)       // event part of the log
+#define REF_LOG_EVENTS_SIZE (1024u * 1024u)      // event part of the log
+#define REF_LOG_EVERY_PASSES 100                  // a quiet pass is logged only this often
+#define REF_SAVE_MS          60000                // progress/log saved at least this often
 #define REF_LOG_TABLE_SIZE  STD_BUFFER_SIZE      // per-sector table (rebuilt on every save)
 #define REF_LOG_MAX_LINES   20000
 #define REF_COUNTDOWN_SEC   10
@@ -79,6 +81,9 @@ typedef struct {
     u64 pass_timer;
     u64 attempts_before_pass;
     u32 round;                // repair round (auto retry)
+    u32 last_resolved;        // fixed+unfixable+skipped at the last logged pass
+    u32 quiet_passes;         // passes since the last logged one
+    u64 save_timer;           // since the last progress/log save
     u32 fixed_at_round_start; // to count the sectors fixed in the current round
     u32 round_fixed[REF_HISTORY]; // sectors fixed in the last finished rounds (ring buffer)
     u32 rounds_done;
@@ -201,15 +206,27 @@ static bool save_state(RefCtx* ctx) {
 
 static void io_end_pass(void* vctx, const CartRefStatus* st) {
     RefCtx* ctx = (RefCtx*) vctx;
-    log_time(ctx);
-    log_printf(ctx, "round %lu pass %lu done in %llu s: remaining %lu, fixed %lu, unfixable %lu, skipped %lu, refresh reads %llu (total %llu)\n",
-        ctx->round, st->pass, (unsigned long long) timer_sec(ctx->pass_timer), st->pending, st->fixed, st->unfixable, st->skipped,
-        (unsigned long long) (st->total_attempts - ctx->attempts_before_pass), (unsigned long long) st->total_attempts);
-    ctx->attempts_before_pass = st->total_attempts;
+    // A pass takes about a second, so logging and saving every one of them
+    // filled the log within the first hours and wrote the SD card nonstop.
+    // Log a pass when a sector got resolved (or every REF_LOG_EVERY_PASSES),
+    // save when something changed or once a minute.
+    u32 resolved = st->fixed + st->unfixable + st->skipped;
+    bool changed = resolved != ctx->last_resolved;
+    if (changed || (++ctx->quiet_passes >= REF_LOG_EVERY_PASSES)) {
+        log_time(ctx);
+        log_printf(ctx, "round %lu pass %lu: remaining %lu, fixed %lu, unfixable %lu, skipped %lu, refresh reads %llu since last line (total %llu)\n",
+            ctx->round, st->pass, st->pending, st->fixed, st->unfixable, st->skipped,
+            (unsigned long long) (st->total_attempts - ctx->attempts_before_pass), (unsigned long long) st->total_attempts);
+        ctx->attempts_before_pass = st->total_attempts;
+        ctx->quiet_passes         = 0;
+    }
     ctx->pass_timer = timer_start();
-    // save progress and log after every pass, so nothing is lost on power-off
-    save_state(ctx);
-    log_save(ctx);
+    if (changed || (timer_msec(ctx->save_timer) >= REF_SAVE_MS)) {
+        ctx->last_resolved = resolved;
+        ctx->save_timer    = timer_start();
+        save_state(ctx);
+        log_save(ctx);
+    }
 }
 
 // Wait `secs` seconds. Returns false if the user cancelled with B.
@@ -815,8 +832,10 @@ u32 FixCartWithReference(const char* cart_path) {
             CartRef_Count(&list, &rs);
             log_time(&ctx);
             log_printf(&ctx, "round %lu start: %lu sectors to work on\n", ctx.round, rs.pending);
-            ctx.run_timer = ctx.pass_timer = timer_start();
-            ctx.attempts_before_pass = 0;
+            ctx.run_timer = ctx.pass_timer = ctx.save_timer = timer_start();
+            ctx.attempts_before_pass = 0; /* the engine counts attempts per round */
+            ctx.last_resolved        = rs.fixed + rs.unfixable + rs.skipped;
+            ctx.quiet_passes         = 0;
             ClearScreenF(true, false, COLOR_STD_BG);
             ctx.fixed_at_round_start = rs.fixed;
             res = CartRef_Repair(&io, &params, &list);
