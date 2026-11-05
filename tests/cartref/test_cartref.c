@@ -114,6 +114,7 @@ static void test_scan_and_repair(void) {
 
     CartRefParams p;
     CartRef_DefaultParams(&p);
+    p.cold_every = 1; p.near_burst = 0; // uniform scheduling for these checks
     p.stuck_limit = 10;
     p.retries_before_skip = 200;
     p.autoskip = true;
@@ -165,10 +166,35 @@ static void test_runs_share_commands(void)
     CartRef_ListAdd(&l, 600);
     CartRefParams p;
     CartRef_DefaultParams(&p);
+    p.cold_every = 1; p.near_burst = 0; // uniform scheduling for these checks
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     for (s = 0; s < 5; s++) CHECK(l.s[s].state == CARTREF_FIXED);
     printf("runs: %u refreshing commands for 5 sectors\n", m->refreshes);
     CHECK(m->refreshes <= 14);
+    CartRef_ListFree(&l);
+    free_mock(m);
+}
+
+static void test_near_miss_priority(void) {
+    Mock* m = new_mock();
+    m->fault[100] = FLAKY;   // near miss on every refreshed read
+    m->fault[500] = NOISE;   // never right, never stuck: no near misses
+    CartRefIo io = io_for(m);
+    CartRefList l;
+    CartRef_ListInit(&l, 10);
+    CartRef_ListAdd(&l, 100);
+    CartRef_ListAdd(&l, 500);
+    CartRefParams p;
+    CartRef_DefaultParams(&p);
+    p.retries_before_skip = 400; // 100 passes of 4
+    p.autoskip = true;
+    CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
+    CHECK(find(&l, 100)->state == CARTREF_SKIPPED && find(&l, 500)->state == CARTREF_SKIPPED);
+    // the cold sector got about one visit in CARTREF_COLD_EVERY passes, the hot one bursts
+    CHECK(find(&l, 500)->attempts <= 4 * (100 / CARTREF_COLD_EVERY + 2));
+    CHECK(find(&l, 100)->attempts > 4 * 100);
+    CHECK(find(&l, 500)->near_miss == 0 && find(&l, 100)->near_miss == find(&l, 100)->attempts);
+    printf("priority: hot %u attempts, cold %u attempts\n", find(&l, 100)->attempts, find(&l, 500)->attempts);
     CartRef_ListFree(&l);
     free_mock(m);
 }
@@ -183,10 +209,11 @@ static void test_noise_not_stuck(void) {
     CartRef_ListAdd(&l, 10);
     CartRefParams p;
     CartRef_DefaultParams(&p);
+    p.cold_every = 1; p.near_burst = 0;
     p.stuck_limit = 5; p.retries_before_skip = 30; p.autoskip = true;
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     CHECK(l.s[0].state == CARTREF_SKIPPED);
-    CHECK(l.s[0].attempts == 30);
+    CHECK(l.s[0].attempts >= 28 && l.s[0].attempts <= 32); // the limit is counted in passes of 4 attempts
     CartRef_ListFree(&l);
     free_mock(m);
 }
@@ -200,6 +227,7 @@ static void test_read_errors(void) {
     CartRef_ListAdd(&l, 10);
     CartRefParams p;
     CartRef_DefaultParams(&p);
+    p.cold_every = 1; p.near_burst = 0;
     m->fail_next = 2; // transient: recovers
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     CHECK(l.s[0].state == CARTREF_FIXED);
@@ -231,6 +259,7 @@ static void test_abort_and_resume(void) {
     CartRef_ListAdd(&l, 300);
     CartRefParams p;
     CartRef_DefaultParams(&p);
+    p.cold_every = 1; p.near_burst = 0;
     m->abort_after = 100;
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_ABORTED);
     CHECK(find(&l, 300)->state == CARTREF_FIXED);
@@ -238,7 +267,7 @@ static void test_abort_and_resume(void) {
     CartRefResumeHeader h = { 0, 0, 0x0004000000123400ull, (uint64_t) NSECT * CARTREF_SECTOR, 777, 0, 0 };
     uint8_t out[4096];
     size_t sz = CartRef_SaveState(&l, &h, out, sizeof(out));
-    CHECK(sz == sizeof(CartRefResumeHeader) + 30 * 4);
+    CHECK(sz == sizeof(CartRefResumeHeader) + 30 * CARTREF_STATE_ENTRY);
     CHECK(CartRef_SaveState(&l, &h, out, 16) == 0);
 
     CartRefList l2;
@@ -246,6 +275,26 @@ static void test_abort_and_resume(void) {
     CHECK(CartRef_LoadState(&l2, &h, out, sz));
     CHECK(l2.count == 30 && l2.s[0].sector == 200 && l2.s[29].sector == 229);
     CHECK(l2.s[5].state == CARTREF_PENDING);
+    // near misses survive a save/load
+    {
+        CartRefList a; CartRef_ListInit(&a, 4);
+        CartRef_ListAdd(&a, 10); CartRef_ListAdd(&a, 11);
+        a.s[1].near_miss = 1234;
+        uint8_t o[256];
+        size_t z = CartRef_SaveState(&a, &h, o, sizeof(o));
+        CartRefList b; CartRef_ListInit(&b, 4);
+        CHECK(z && CartRef_LoadState(&b, &h, o, z));
+        CHECK(b.count == 2 && b.s[0].near_miss == 0 && b.s[1].near_miss == 1234);
+        // old v2 state (u32 sectors only) still loads
+        CartRefResumeHeader h2 = h; h2.magic = CARTREF_MAGIC; h2.version = 2; h2.count = 2;
+        uint8_t o2[sizeof(h2) + 8];
+        uint32_t secs[2] = { 20, 21 };
+        memcpy(o2, &h2, sizeof(h2)); memcpy(o2 + sizeof(h2), secs, 8);
+        CartRefList c; CartRef_ListInit(&c, 4);
+        CHECK(CartRef_LoadState(&c, &h, o2, sizeof(o2)));
+        CHECK(c.count == 2 && c.s[1].sector == 21 && c.s[1].near_miss == 0);
+        CartRef_ListFree(&a); CartRef_ListFree(&b); CartRef_ListFree(&c);
+    }
 
     CartRefResumeHeader other = h;
     other.ref_size = 778;
@@ -280,6 +329,7 @@ static void test_overflow(void) {
 int main(void) {
     test_scan_and_repair();
     test_runs_share_commands();
+    test_near_miss_priority();
     test_noise_not_stuck();
     test_read_errors();
     test_abort_and_resume();

@@ -13,6 +13,8 @@ void CartRef_DefaultParams(CartRefParams* p) {
     p->autoskip = false;
     p->attempts_per_visit = 4;
     p->confirm_reads = 5;
+    p->cold_every = CARTREF_COLD_EVERY;
+    p->near_burst = CARTREF_NEAR_BURST;
 }
 
 bool CartRef_ListInit(CartRefList* l, uint32_t capacity) {
@@ -43,10 +45,10 @@ bool CartRef_ListAdd(CartRefList* l, uint32_t sector) {
 }
 
 void CartRef_Count(const CartRefList* l, CartRefStatus* st) {
-    st->pending = st->fixed = st->unfixable = st->skipped = 0;
+    st->pending = st->fixed = st->unfixable = st->skipped = st->hot = 0;
     for (uint32_t i = 0; i < l->count; i++) {
         switch (l->s[i].state) {
-            case CARTREF_PENDING:   st->pending++; break;
+            case CARTREF_PENDING:   st->pending++; if (l->s[i].near_miss) st->hot++; break;
             case CARTREF_FIXED:     st->fixed++; break;
             case CARTREF_UNFIXABLE: st->unfixable++; break;
             default:                st->skipped++; break;
@@ -151,6 +153,13 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
 
         st.pass++;
         if (io->begin_pass) io->begin_pass(io->ctx);
+        /* cold runs (no near miss yet) only get every Nth pass, unless nothing is hot */
+        bool any_hot = false;
+        for (uint32_t j = 0; j < list->count; j++)
+            if ((list->s[j].state == CARTREF_PENDING) && list->s[j].near_miss) { any_hot = true; break; }
+        bool cold_pass = !any_hot || (p->cold_every <= 1) || ((st.pass % p->cold_every) == 1);
+        /* round-relative attempt budget: the skip limit is reached by every sector at the same pass */
+        bool at_limit = (uint64_t) st.pass * apv >= p->retries_before_skip;
 
         uint32_t i = 0;
         while (i < list->count) {
@@ -166,11 +175,18 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                 n++;
             CartRefSector* run = &list->s[i];
             uint32_t first = run[0].sector;
+            bool hot = false;
+            for (uint32_t k = 0; k < n; k++) hot |= (run[k].near_miss != 0);
+            if (!hot && !cold_pass && !at_limit) {
+                i += n;
+                continue;
+            }
 
             if (io->poll_abort && io->poll_abort(io->ctx))
                 return CARTREF_ABORTED;
 
-            for (uint32_t a = 0; a < apv; a++) {
+            uint32_t limit = apv;
+            for (uint32_t a = 0; a < limit; a++) {
                 uint32_t open = 0;
                 for (uint32_t k = 0; k < n; k++)
                     open += (run[k].state == CARTREF_PENDING);
@@ -217,6 +233,12 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                     if (m[k] && !cand[k] && !readerr) { /* matched once, then the plain reads disagreed */
                         s->near_miss++;
                         st.near_misses++;
+                        /* close to recovering: keep at it for a while */
+                        if (p->near_burst) {
+                            uint32_t want = a + 1 + p->near_burst;
+                            if (want > CARTREF_BURST_MAX) want = CARTREF_BURST_MAX;
+                            if (want > limit) limit = want;
+                        }
                     }
                     if (cand[k] && !readerr) {
                         s->state = CARTREF_FIXED;
@@ -233,7 +255,7 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                     }
                     if (p->stuck_limit && (s->stuck >= p->stuck_limit)) {
                         s->state = CARTREF_UNFIXABLE;
-                    } else if (s->attempts >= p->retries_before_skip) {
+                    } else if (at_limit) {
                         if (p->autoskip || (io->poll_skip && io->poll_skip(io->ctx)))
                             s->state = CARTREF_SKIPPED;
                     }
@@ -257,7 +279,7 @@ size_t CartRef_SaveState(const CartRefList* l, const CartRefResumeHeader* hdr, v
     for (uint32_t i = 0; i < l->count; i++)
         if (l->s[i].state != CARTREF_FIXED) n++;
 
-    size_t size = sizeof(CartRefResumeHeader) + (size_t) n * sizeof(uint32_t);
+    size_t size = sizeof(CartRefResumeHeader) + (size_t) n * CARTREF_STATE_ENTRY;
     if (size > out_size) return 0;
 
     CartRefResumeHeader h = *hdr;
@@ -271,7 +293,8 @@ size_t CartRef_SaveState(const CartRefList* l, const CartRefResumeHeader* hdr, v
     for (uint32_t i = 0; i < l->count; i++) {
         if (l->s[i].state == CARTREF_FIXED) continue;
         memcpy(w, &l->s[i].sector, sizeof(uint32_t));
-        w += sizeof(uint32_t);
+        memcpy(w + 4, &l->s[i].near_miss, sizeof(uint32_t));
+        w += CARTREF_STATE_ENTRY;
     }
     return size;
 }
@@ -280,18 +303,21 @@ bool CartRef_LoadState(CartRefList* l, const CartRefResumeHeader* expect, const 
     CartRefResumeHeader h;
     if (size < sizeof(h)) return false;
     memcpy(&h, data, sizeof(h));
-    if ((h.magic != CARTREF_MAGIC) || (h.version != CARTREF_VERSION)) return false;
+    if ((h.magic != CARTREF_MAGIC) || ((h.version != 2) && (h.version != CARTREF_VERSION))) return false;
     if ((h.title_id != expect->title_id) || (h.cart_size != expect->cart_size) ||
         (h.ref_size != expect->ref_size)) return false;
-    if (size != sizeof(h) + (size_t) h.count * sizeof(uint32_t)) return false;
+    size_t esz = (h.version == 2) ? 4 : CARTREF_STATE_ENTRY;
+    if (size != sizeof(h) + (size_t) h.count * esz) return false;
 
     const uint8_t* rd = (const uint8_t*) data + sizeof(h);
     uint32_t max_sector = (uint32_t) (h.cart_size / CARTREF_SECTOR);
     for (uint32_t i = 0; i < h.count; i++) {
-        uint32_t sector;
-        memcpy(&sector, rd + (size_t) i * sizeof(uint32_t), sizeof(uint32_t));
+        uint32_t sector, near = 0;
+        memcpy(&sector, rd + (size_t) i * esz, sizeof(uint32_t));
+        if (esz > 4) memcpy(&near, rd + (size_t) i * esz + 4, sizeof(uint32_t));
         if (sector >= max_sector) return false;
         if (!CartRef_ListAdd(l, sector)) break;
+        l->s[l->count - 1].near_miss = near;
     }
     return true;
 }

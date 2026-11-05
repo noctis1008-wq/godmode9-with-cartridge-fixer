@@ -18,6 +18,9 @@
 #define CARTREF_SECTOR      0x200u
 #define CARTREF_SCAN_CHUNK  0x800u   // sectors per scan read (1 MB)
 #define CARTREF_RUN_MAX     4u       // neighbouring bad sectors handled by one refresh + read
+#define CARTREF_COLD_EVERY  8u       // default: runs without near misses are visited every Nth pass
+#define CARTREF_NEAR_BURST  8u       // default: extra attempts right after a near miss ...
+#define CARTREF_BURST_MAX   64u      // ... up to this many attempts in one visit
 
 typedef enum {
     CARTREF_PENDING = 0,
@@ -54,6 +57,8 @@ typedef struct {
     bool autoskip;                // skip automatically at retries_before_skip
     uint32_t attempts_per_visit;  // attempts on one sector before moving to the next
     uint32_t confirm_reads;       // matching plain reads required to call it fixed
+    uint32_t cold_every;          // visit runs without near misses every Nth pass (0/1: every pass)
+    uint32_t near_burst;          // extra attempts after a near miss (0: none)
 } CartRefParams;
 
 typedef enum {
@@ -70,6 +75,7 @@ typedef struct {
     uint32_t current_attempts;
     uint64_t total_attempts;
     uint64_t near_misses;          // repair: refreshed matches that did not hold
+    uint32_t hot;                  // repair: pending sectors that had a near miss
 } CartRefStatus;
 
 typedef struct {
@@ -118,7 +124,12 @@ CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint
                            CartRefList* list, uint8_t* buf);
 
 // Work on every PENDING sector of `list` until all are resolved or the user
-// stops. Sectors are visited round-robin, a few attempts at a time.
+// stops. Sectors are visited round-robin, a few attempts at a time. Runs that
+// have had a near miss (the only ones real logs show getting fixed) are
+// visited every pass, the others every `cold_every` passes; a near miss also
+// extends the current visit by `near_burst` attempts. The skip
+// limit counts passes (retries_before_skip / attempts_per_visit), so every
+// sector of a round reaches it at the same time.
 CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRefList* list);
 
 // Resume state (serialised list of unresolved sectors).
@@ -128,16 +139,18 @@ typedef struct {
     uint64_t title_id;
     uint64_t cart_size;    // bytes
     uint64_t ref_size;     // bytes
-    uint32_t count;        // number of u32 sector entries that follow
+    uint32_t count;        // number of entries that follow (v3: u32 sector + u32 near misses; v2: u32 sector)
     uint32_t reserved;
 } CartRefResumeHeader;
 
 #define CARTREF_MAGIC   0x31464352u  // "CRF1"
-#define CARTREF_VERSION 2u
+#define CARTREF_VERSION 3u
+#define CARTREF_STATE_ENTRY 8u    // bytes per saved sector (v3)
 
 // Serialise unresolved (PENDING / UNFIXABLE / SKIPPED) sectors into `out`
-// (header + u32 list). Returns the byte size, or 0 if `out_size` is too small.
+// (header + entries). Returns the byte size, or 0 if `out_size` is too small.
 size_t CartRef_SaveState(const CartRefList* l, const CartRefResumeHeader* hdr, void* out, size_t out_size);
-// Restore a list from saved state. Restored sectors start as PENDING.
+// Restore a list from saved state (v3, or v2 without near misses). Restored
+// sectors start as PENDING.
 // Returns false if the data is invalid or does not match `expect`.
 bool CartRef_LoadState(CartRefList* l, const CartRefResumeHeader* expect, const void* data, size_t size);

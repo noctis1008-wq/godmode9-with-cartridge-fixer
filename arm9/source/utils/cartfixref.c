@@ -193,7 +193,7 @@ static bool save_state(RefCtx* ctx) {
         fvx_unlink(ctx->state_file);
         return false;
     }
-    size_t max = sizeof(CartRefResumeHeader) + (size_t) ctx->list->count * 4;
+    size_t max = sizeof(CartRefResumeHeader) + (size_t) ctx->list->count * CARTREF_STATE_ENTRY;
     void* sdata = malloc(max);
     size_t sz = sdata ? CartRef_SaveState(ctx->list, ctx->rhdr, sdata, max) : 0;
     bool ok = false;
@@ -215,10 +215,10 @@ static void io_end_pass(void* vctx, const CartRefStatus* st) {
     bool changed = resolved != ctx->last_resolved;
     if (changed || (++ctx->quiet_passes >= REF_LOG_EVERY_PASSES)) {
         log_time(ctx);
-        log_printf(ctx, "round %lu pass %lu: remaining %lu, fixed %lu, unfixable %lu, skipped %lu, refresh reads %llu since last line (total %llu), near misses %llu\n",
+        log_printf(ctx, "round %lu pass %lu: remaining %lu, fixed %lu, unfixable %lu, skipped %lu, refresh reads %llu since last line (total %llu), near misses %llu, near-miss sectors %lu\n",
             ctx->round, st->pass, st->pending, st->fixed, st->unfixable, st->skipped,
             (unsigned long long) (st->total_attempts - ctx->attempts_before_pass), (unsigned long long) st->total_attempts,
-            (unsigned long long) st->near_misses);
+            (unsigned long long) st->near_misses, (unsigned long) st->hot);
         ctx->attempts_before_pass = st->total_attempts;
         ctx->quiet_passes         = 0;
     }
@@ -470,7 +470,8 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     snprintf(line, sizeof(line), "Round %-3lu Pass %-6lu Time %02lu:%02lu:%02lu   ", (unsigned long) ctx->round, (unsigned long) st->pass,
         (unsigned long) (sec / 3600), (unsigned long) ((sec / 60) % 60), (unsigned long) (sec % 60));
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
-    snprintf(line, sizeof(line), "Remaining  %-10lu              ", (unsigned long) st->pending);
+    snprintf(line, sizeof(line), "Remaining  %-6lu (near miss: %lu)        ", (unsigned long) st->pending,
+        (unsigned long) st->hot);
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
     // estimate from the rate at which sectors got resolved so far in this run
     u32 resolved = st->fixed + st->unfixable + st->skipped;
@@ -684,7 +685,7 @@ u32 FixCartWithReference(const char* cart_path) {
 
     bool resumed = false;
     u64 ssize = fvx_qsize(spath);
-    if (ssize && (ssize <= sizeof(CartRefResumeHeader) + (u64) REF_LIST_CAPACITY * 4)) {
+    if (ssize && (ssize <= sizeof(CartRefResumeHeader) + (u64) REF_LIST_CAPACITY * CARTREF_STATE_ENTRY)) {
         void* sdata = malloc(ssize);
         if (sdata && (FileGetData(spath, sdata, ssize, 0) == ssize) &&
             CartRef_LoadState(&list, &rhdr, sdata, ssize)) {
@@ -758,8 +759,9 @@ u32 FixCartWithReference(const char* cart_path) {
             (unsigned long long) ref_size);
         log_printf(&ctx, "%s", partinfo);
         FixerCfg_Load(&fixer_cfg);
-        log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5\n",
-            fixer_cfg.stuck_limit, fixer_cfg.retries_before_skip, fixer_cfg.autoskip ? 1 : 0);
+        log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5 cold_every=%u near_burst=%u\n",
+            fixer_cfg.stuck_limit, fixer_cfg.retries_before_skip, fixer_cfg.autoskip ? 1 : 0,
+            (unsigned) CARTREF_COLD_EVERY, (unsigned) CARTREF_NEAR_BURST); /* = the CartRef_DefaultParams values */
         if (*FixerSim_Status()) log_printf(&ctx, "SIM BUILD: %s\n", FixerSim_Status());
         log_printf(&ctx, "auto retry: %s\n", autoretry ? "on" : "off");
         log_printf(&ctx, "%s\n", resumed ? "resumed from saved progress" : "new scan");
