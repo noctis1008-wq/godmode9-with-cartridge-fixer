@@ -8,7 +8,7 @@
 
 #define NSECT 6000u
 
-typedef enum { OK = 0, RECOVER, STUCK, FLAKY, NOISE } Fault;
+typedef enum { OK = 0, RECOVER, STUCK, FLAKY, NOISE, WIDEFIX } Fault;
 
 typedef struct {
     uint8_t* ref;
@@ -31,6 +31,7 @@ static void fill_bad(uint8_t* b, uint32_t seed) {
 static int m_cart_read(void* ctx, uint32_t sector, uint32_t count, void* buf, bool refresh) {
     Mock* m = ctx;
     if (m->fail_next > 0) { m->fail_next--; return 1; }
+    if (sector + count > NSECT) return 1; // past the end of the card
     m->reads++;
     if (refresh) m->refreshes++;
     uint8_t* out = buf;
@@ -46,6 +47,10 @@ static int m_cart_read(void* ctx, uint32_t sector, uint32_t count, void* buf, bo
             case STUCK: fill_bad(o, 999); break;
             case FLAKY: if (!refresh) fill_bad(o, rnd()); break; // correct only right after refresh
             case NOISE: fill_bad(o, rnd() | 1); break;
+            case WIDEFIX: // restored for good by a refreshed read of a whole 4 KB block
+                if (refresh && (count >= 8)) m->fault[s] = OK;
+                else fill_bad(o, rnd() | 1);
+                break;
             default: break;
         }
     }
@@ -83,7 +88,7 @@ static Mock* new_mock(void) {
 static void free_mock(Mock* m) { free(m->ref); free(m); }
 
 static CartRefIo io_for(Mock* m) {
-    CartRefIo io = { m, m_cart_read, m_ref_compare, m_begin_pass, m_abort, NULL, NULL, m_end_pass };
+    CartRefIo io = { m, m_cart_read, m_ref_compare, m_begin_pass, m_abort, NULL, NULL, m_end_pass, NULL, NULL, NULL };
     return io;
 }
 
@@ -114,7 +119,7 @@ static void test_scan_and_repair(void) {
 
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0; // uniform scheduling for these checks
+    p.cold_every = 1; p.near_burst = 0; p.experiment = false; // uniform scheduling for these checks
     p.stuck_limit = 10;
     p.retries_before_skip = 200;
     p.autoskip = true;
@@ -166,7 +171,7 @@ static void test_runs_share_commands(void)
     CartRef_ListAdd(&l, 600);
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0; // uniform scheduling for these checks
+    p.cold_every = 1; p.near_burst = 0; p.experiment = false; // uniform scheduling for these checks
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     for (s = 0; s < 5; s++) CHECK(l.s[s].state == CARTREF_FIXED);
     printf("runs: %u refreshing commands for 5 sectors\n", m->refreshes);
@@ -187,6 +192,7 @@ static void test_near_miss_priority(void) {
     CartRefParams p;
     CartRef_DefaultParams(&p);
     p.retries_before_skip = 400; // 100 passes of 4
+    p.experiment = false;
     p.autoskip = true;
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     CHECK(find(&l, 100)->state == CARTREF_SKIPPED && find(&l, 500)->state == CARTREF_SKIPPED);
@@ -195,6 +201,41 @@ static void test_near_miss_priority(void) {
     CHECK(find(&l, 100)->attempts > 4 * 100);
     CHECK(find(&l, 500)->near_miss == 0 && find(&l, 100)->near_miss == find(&l, 100)->attempts);
     printf("priority: hot %u attempts, cold %u attempts\n", find(&l, 100)->attempts, find(&l, 500)->attempts);
+    CartRef_ListFree(&l);
+    free_mock(m);
+}
+
+static int s_refresh_only(void* ctx) { ((Mock*) ctx)->refreshes++; return 0; }
+static uint32_t s_waited = 0;
+static void s_wait(void* ctx, uint32_t ms) { (void) ctx; s_waited += ms; }
+static uint32_t s_clock = 0;
+static uint32_t s_msec(void* ctx) { (void) ctx; return s_clock += 2; }
+
+static void test_strategies(void) {
+    Mock* m = new_mock();
+    m->fault[1001] = WIDEFIX;         // only the wide read helps
+    m->fault[2000] = NOISE;           // nothing helps
+    m->fault[NSECT - 1] = WIDEFIX;    // last sector of the card (block ends exactly there)
+    CartRefIo io = io_for(m);
+    io.refresh_only = s_refresh_only; io.wait_ms = s_wait; io.msec = s_msec;
+    CartRefList l;
+    CartRef_ListInit(&l, 10);
+    CartRef_ListAdd(&l, 1001);
+    CartRef_ListAdd(&l, 2000);
+    CartRef_ListAdd(&l, NSECT - 1);
+    CartRefParams p;
+    CartRef_DefaultParams(&p);
+    p.retries_before_skip = 80; p.autoskip = true;
+    CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
+    CHECK(find(&l, 1001)->state == CARTREF_FIXED);
+    CHECK(find(&l, 2000)->state == CARTREF_SKIPPED);
+    CHECK(l.strat[CARTREF_STRAT_WIDE].fixed >= 1 && l.strat[CARTREF_STRAT_NORMAL].fixed == 0);
+    for (int i = 0; i < CARTREF_STRATS; i++) CHECK(l.strat[i].attempts > 0 && l.strat[i].msec > 0);
+    CHECK(s_waited == l.strat[CARTREF_STRAT_WAIT].attempts * CARTREF_WAIT_MS);
+    printf("strategies: attempts %llu/%llu/%llu/%llu, wide fixed %u, last sector %d\n",
+        (unsigned long long) l.strat[0].attempts, (unsigned long long) l.strat[1].attempts,
+        (unsigned long long) l.strat[2].attempts, (unsigned long long) l.strat[3].attempts,
+        l.strat[CARTREF_STRAT_WIDE].fixed, find(&l, NSECT - 1)->state);
     CartRef_ListFree(&l);
     free_mock(m);
 }
@@ -209,7 +250,7 @@ static void test_noise_not_stuck(void) {
     CartRef_ListAdd(&l, 10);
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0;
+    p.cold_every = 1; p.near_burst = 0; p.experiment = false;
     p.stuck_limit = 5; p.retries_before_skip = 30; p.autoskip = true;
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     CHECK(l.s[0].state == CARTREF_SKIPPED);
@@ -227,7 +268,7 @@ static void test_read_errors(void) {
     CartRef_ListAdd(&l, 10);
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0;
+    p.cold_every = 1; p.near_burst = 0; p.experiment = false;
     m->fail_next = 2; // transient: recovers
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     CHECK(l.s[0].state == CARTREF_FIXED);
@@ -259,7 +300,7 @@ static void test_abort_and_resume(void) {
     CartRef_ListAdd(&l, 300);
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0;
+    p.cold_every = 1; p.near_burst = 0; p.experiment = false;
     m->abort_after = 100;
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_ABORTED);
     CHECK(find(&l, 300)->state == CARTREF_FIXED);
@@ -330,6 +371,7 @@ int main(void) {
     test_scan_and_repair();
     test_runs_share_commands();
     test_near_miss_priority();
+    test_strategies();
     test_noise_not_stuck();
     test_read_errors();
     test_abort_and_resume();

@@ -15,11 +15,13 @@ void CartRef_DefaultParams(CartRefParams* p) {
     p->confirm_reads = 5;
     p->cold_every = CARTREF_COLD_EVERY;
     p->near_burst = CARTREF_NEAR_BURST;
+    p->experiment = true;
 }
 
 bool CartRef_ListInit(CartRefList* l, uint32_t capacity) {
     l->count = 0;
     l->overflow = false;
+    memset(l->strat, 0, sizeof(l->strat));
     l->capacity = capacity;
     l->s = (CartRefSector*) malloc((size_t) capacity * sizeof(CartRefSector));
     if (!l->s) l->capacity = 0;
@@ -135,6 +137,8 @@ CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint
 CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRefList* list) {
     static uint8_t cbuf[CARTREF_RUN_MAX * CARTREF_SECTOR]; /* the refreshed read (static: keep it off the small ARM9 stack) */
     static uint8_t vbuf[CARTREF_RUN_MAX * CARTREF_SECTOR]; /* confirmation reads */
+    static uint8_t wbuf[2 * CARTREF_WIDE * CARTREF_SECTOR]; /* "wide" reads (a run may cross a block) */
+    static uint32_t strat_next = 0;
     uint8_t m[CARTREF_RUN_MAX];
     uint8_t cand[CARTREF_RUN_MAX];
     uint32_t apv = p->attempts_per_visit ? p->attempts_per_visit : 1;
@@ -192,13 +196,49 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                     open += (run[k].state == CARTREF_PENDING);
                 if (!open) break;
 
-                if (io->cart_read(io->ctx, first, n, cbuf, true) != 0) {
+                /* pick the read strategy (rotating, skipping those the io cannot do) */
+                uint32_t sidx = CARTREF_STRAT_NORMAL;
+                if (p->experiment) {
+                    for (uint32_t t = 0; t < CARTREF_STRATS; t++) {
+                        uint32_t c = strat_next++ % CARTREF_STRATS;
+                        if (((c == CARTREF_STRAT_WAIT) && (!io->refresh_only || !io->wait_ms)) ||
+                            ((c == CARTREF_STRAT_DOUBLE) && !io->refresh_only))
+                            continue;
+                        sidx = c;
+                        break;
+                    }
+                }
+                uint32_t t0 = io->msec ? io->msec(io->ctx) : 0;
+                const uint8_t* data = cbuf;
+                int rr = 1;
+                if (sidx == CARTREF_STRAT_WIDE) {
+                    uint32_t ws = first & ~(CARTREF_WIDE - 1);
+                    uint32_t we = ((first + n - 1) | (CARTREF_WIDE - 1)) + 1;
+                    rr = io->cart_read(io->ctx, ws, we - ws, wbuf, true);
+                    if (!rr) data = wbuf + (size_t) (first - ws) * CARTREF_SECTOR;
+                    else sidx = CARTREF_STRAT_NORMAL; /* e.g. past the end of the card: plain attempt instead */
+                }
+                if (sidx == CARTREF_STRAT_WAIT) {
+                    rr = io->refresh_only(io->ctx);
+                    if (!rr) {
+                        io->wait_ms(io->ctx, CARTREF_WAIT_MS);
+                        rr = io->cart_read(io->ctx, first, n, cbuf, false);
+                    }
+                } else if (sidx == CARTREF_STRAT_DOUBLE) {
+                    rr = io->refresh_only(io->ctx);
+                    if (!rr) rr = io->cart_read(io->ctx, first, n, cbuf, true);
+                } else if (sidx == CARTREF_STRAT_NORMAL) {
+                    rr = io->cart_read(io->ctx, first, n, cbuf, true);
+                }
+                if (rr != 0) {
                     if (++read_fails >= CARTREF_MAX_READ_FAILS) return CARTREF_CART_ERROR;
                     continue;
                 }
                 read_fails = 0;
                 st.total_attempts++;
-                if (io->ref_compare(io->ctx, first, n, cbuf, m) != 0)
+                CartRefStratStats* ss = &list->strat[sidx];
+                ss->attempts++;
+                if (io->ref_compare(io->ctx, first, n, data, m) != 0)
                     return CARTREF_REF_ERROR;
 
                 /* matches get confirmed with plain reads (no refresh) */
@@ -233,6 +273,7 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                     if (m[k] && !cand[k] && !readerr) { /* matched once, then the plain reads disagreed */
                         s->near_miss++;
                         st.near_misses++;
+                        ss->near_misses++;
                         /* close to recovering: keep at it for a while */
                         if (p->near_burst) {
                             uint32_t want = a + 1 + p->near_burst;
@@ -242,10 +283,11 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                     }
                     if (cand[k] && !readerr) {
                         s->state = CARTREF_FIXED;
+                        ss->fixed++;
                         continue;
                     }
                     if (!m[k]) { /* a match that did not hold is no evidence of being stuck */
-                        uint32_t sum = sector_sum(&cbuf[(size_t) k * CARTREF_SECTOR]);
+                        uint32_t sum = sector_sum(&data[(size_t) k * CARTREF_SECTOR]);
                         if ((s->attempts > 1) && (sum == s->last_sum)) {
                             s->stuck++;
                         } else {
@@ -260,6 +302,7 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                             s->state = CARTREF_SKIPPED;
                     }
                 }
+                if (io->msec) ss->msec += (uint32_t) (io->msec(io->ctx) - t0);
             }
 
             st.current_sector = first;

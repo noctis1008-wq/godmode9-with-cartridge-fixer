@@ -21,6 +21,25 @@
 #define CARTREF_COLD_EVERY  8u       // default: runs without near misses are visited every Nth pass
 #define CARTREF_NEAR_BURST  8u       // default: extra attempts right after a near miss ...
 #define CARTREF_BURST_MAX   64u      // ... up to this many attempts in one visit
+#define CARTREF_WAIT_MS     5u       // "wait" strategy: pause between refresh and read
+#define CARTREF_WIDE        8u       // "wide" strategy: read the aligned 4 KB block around the run
+
+// Read strategies, tried in turn on every attempt when CartRefParams.experiment
+// is set, with their success counted separately (CartRefList.strat).
+enum {
+    CARTREF_STRAT_NORMAL = 0, // refresh + read of the run
+    CARTREF_STRAT_WIDE,       // refresh + read of the whole aligned 4 KB block
+    CARTREF_STRAT_WAIT,       // refresh, wait CARTREF_WAIT_MS, plain read
+    CARTREF_STRAT_DOUBLE,     // extra refresh, then refresh + read
+    CARTREF_STRATS
+};
+
+typedef struct {
+    uint64_t attempts;    // refreshed reads with this strategy
+    uint64_t near_misses; // ... that matched but failed confirmation (per sector)
+    uint32_t fixed;       // sectors fixed by it
+    uint64_t msec;        // time spent (attempt + confirmation), if io->msec is set
+} CartRefStratStats;
 
 typedef enum {
     CARTREF_PENDING = 0,
@@ -44,6 +63,7 @@ typedef struct {
     uint32_t count;
     uint32_t capacity;
     bool overflow;        // more bad sectors existed than fit in the list
+    CartRefStratStats strat[CARTREF_STRATS]; // accumulated over every repair round
 } CartRefList;
 
 typedef struct {
@@ -59,6 +79,7 @@ typedef struct {
     uint32_t confirm_reads;       // matching plain reads required to call it fixed
     uint32_t cold_every;          // visit runs without near misses every Nth pass (0/1: every pass)
     uint32_t near_burst;          // extra attempts after a near miss (0: none)
+    bool experiment;              // rotate the read strategies (needs the optional io calls)
 } CartRefParams;
 
 typedef enum {
@@ -97,6 +118,11 @@ typedef struct {
     void (*status)(void* ctx, const CartRefStatus* st);
     // Called after every repair pass (save progress, write log). May be NULL.
     void (*end_pass)(void* ctx, const CartRefStatus* st);
+    // Optional (strategies): send the refresh command alone (0 = ok), wait,
+    // and a millisecond clock for the time spent per strategy.
+    int  (*refresh_only)(void* ctx);
+    void (*wait_ms)(void* ctx, uint32_t ms);
+    uint32_t (*msec)(void* ctx);
 } CartRefIo;
 
 typedef enum {

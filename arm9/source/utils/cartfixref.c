@@ -290,6 +290,38 @@ static int io_cart_read(void* vctx, u32 sector, u32 count, void* buf, bool refre
     return ((fr != FR_OK) || (br != size)) ? 1 : 0;
 }
 
+// optional engine calls for the read strategies
+static int io_refresh_only(void* vctx) {
+    (void) vctx;
+    return CTR_Refresh() ? 0 : 1;
+}
+
+static void io_wait_ms(void* vctx, u32 ms) {
+    (void) vctx;
+    wait_msec(ms);
+}
+
+static u64 io_clock = 0;
+static u32 io_msec(void* vctx) {
+    (void) vctx;
+    return (u32) timer_msec(io_clock);
+}
+
+// one log line per read strategy: how often it was used and what it achieved
+static void log_strats(RefCtx* ctx) {
+    static const char* sname[CARTREF_STRATS] = { "normal", "wide 4KB", "wait 5ms", "refresh x2" };
+    if (!ctx->list) return;
+    for (u32 i = 0; i < CARTREF_STRATS; i++) {
+        const CartRefStratStats* s = &ctx->list->strat[i];
+        if (!s->attempts) continue;
+        u64 sec = s->msec / 1000;
+        log_printf(ctx, "  strategy %-10s: %llu attempts, %llu s, near misses %llu (%llu per 10k attempts), fixed %lu\n",
+            sname[i], (unsigned long long) s->attempts, (unsigned long long) sec,
+            (unsigned long long) s->near_misses, (unsigned long long) (s->near_misses * 10000 / s->attempts),
+            (unsigned long) s->fixed);
+    }
+}
+
 static int ref_read_at(RefSource* ref, u64 offset, void* buf, UINT size) {
     UINT br = 0;
     if (fvx_lseek(&ref->file, offset) != FR_OK) return 1;
@@ -759,9 +791,9 @@ u32 FixCartWithReference(const char* cart_path) {
             (unsigned long long) ref_size);
         log_printf(&ctx, "%s", partinfo);
         FixerCfg_Load(&fixer_cfg);
-        log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5 cold_every=%u near_burst=%u\n",
+        log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5 cold_every=%u near_burst=%u strategies=normal/wide4KB/wait%ums/refreshx2\n",
             fixer_cfg.stuck_limit, fixer_cfg.retries_before_skip, fixer_cfg.autoskip ? 1 : 0,
-            (unsigned) CARTREF_COLD_EVERY, (unsigned) CARTREF_NEAR_BURST); /* = the CartRef_DefaultParams values */
+            (unsigned) CARTREF_COLD_EVERY, (unsigned) CARTREF_NEAR_BURST, (unsigned) CARTREF_WAIT_MS); /* = the CartRef_DefaultParams values */
         if (*FixerSim_Status()) log_printf(&ctx, "SIM BUILD: %s\n", FixerSim_Status());
         log_printf(&ctx, "auto retry: %s\n", autoretry ? "on" : "off");
         log_printf(&ctx, "%s\n", resumed ? "resumed from saved progress" : "new scan");
@@ -772,7 +804,9 @@ u32 FixCartWithReference(const char* cart_path) {
 
     ctx.status_timer = ctx.run_timer = timer_start();
 
-    CartRefIo io = { &ctx, io_cart_read, io_ref_compare, io_begin_pass, io_poll_abort, io_poll_skip, io_status, io_end_pass };
+    CartRefIo io = { &ctx, io_cart_read, io_ref_compare, io_begin_pass, io_poll_abort, io_poll_skip, io_status, io_end_pass,
+                     io_refresh_only, io_wait_ms, io_msec };
+    io_clock = timer_start();
     CartRefResult res = CARTREF_OK;
 
     if (!resumed) {
@@ -861,6 +895,7 @@ u32 FixCartWithReference(const char* cart_path) {
             log_printf(&ctx, "round %lu end: result %d, fixed %lu, unfixable %lu, skipped %lu, remaining %lu (%llu s)\n",
                 ctx.round, (int) res, rs.fixed, rs.unfixable, rs.skipped, rs.pending,
                 (unsigned long long) timer_sec(ctx.run_timer));
+            log_strats(&ctx);
             if ((res != CARTREF_OK) || !autoretry || !(rs.unfixable + rs.skipped)) break;
 
             // next round straight away: a 10 s countdown every ~3 minutes only
@@ -888,6 +923,7 @@ u32 FixCartWithReference(const char* cart_path) {
     log_printf(&ctx, "end: result %d after %llu s: fixed %lu, unfixable %lu, skipped %lu, remaining %lu, refresh count %lu\n",
         (int) res, (unsigned long long) timer_sec(ctx.run_timer), st.fixed, st.unfixable, st.skipped, st.pending,
         (unsigned long) CTR_GetRefreshCount());
+    log_strats(&ctx);
     if (st.pending || st.unfixable || st.skipped) {
         log_printf(&ctx, "unresolved by region:\n");
         log_distribution(&ctx, &list, true);
