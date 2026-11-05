@@ -183,7 +183,7 @@ If you have a **verified .3ds of the same game and version** (it does not have t
 Why it is faster: the classic fixer can only check data against the game's own hashes, and some areas (ExeFS files such as `code.bin`) have one hash for several MB, so the whole area is re-read on every attempt. With a reference, only the damaged sectors are touched.
 
 - After the scan, the repair starts automatically after 10 seconds (A: start now, B: cancel).
-- **Auto retry** (chosen before each run, remembered): when a round ends with sectors still unfixable or skipped, they are reset and a new round starts automatically after 10 seconds.
+- **Auto retry** (chosen before each run, remembered): when a round ends with sectors still unfixable or skipped, they are reset and the next round starts right away (B pauses at any time).
 - When every sector has been fixed (nothing left to retry), the cartridge is verified automatically (same check as GodMode9's Verify, without prompts), the result is written to the log, and the console powers off after 30 seconds (A: now, B: cancel).
 - The screen shows a rough estimate of the time left, based on how fast sectors have been resolved so far.
 - The two bottom rows show how many sectors each round fixed (newest 10; `*` = the running round).

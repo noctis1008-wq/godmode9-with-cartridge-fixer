@@ -59,9 +59,10 @@ uint32_t CartRef_ResetUnresolved(CartRefList* l) {
     for (uint32_t i = 0; i < l->count; i++) {
         CartRefSector* e = &l->s[i];
         if ((e->state != CARTREF_UNFIXABLE) && (e->state != CARTREF_SKIPPED)) continue;
-        uint32_t sector = e->sector;
+        uint32_t sector = e->sector, near = e->near_miss;
         memset(e, 0, sizeof(*e));
         e->sector = sector;
+        e->near_miss = near;
         e->state = CARTREF_PENDING;
         n++;
     }
@@ -213,6 +214,10 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                     CartRefSector* s = &run[k];
                     if (s->state != CARTREF_PENDING) continue;
                     s->attempts++;
+                    if (m[k] && !cand[k] && !readerr) { /* matched once, then the plain reads disagreed */
+                        s->near_miss++;
+                        st.near_misses++;
+                    }
                     if (cand[k] && !readerr) {
                         s->state = CARTREF_FIXED;
                         continue;

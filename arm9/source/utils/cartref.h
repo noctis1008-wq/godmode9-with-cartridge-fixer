@@ -33,6 +33,7 @@ typedef struct {
     uint16_t stuck;       // consecutive identical mismatching reads
     uint8_t  confirm;     // consecutive matching confirmation reads
     uint8_t  state;       // CartRefState
+    uint32_t near_miss;   // refreshed reads that matched but failed confirmation
 } CartRefSector;
 
 typedef struct {
@@ -68,6 +69,7 @@ typedef struct {
     uint32_t current_sector;       // repair: sector being worked on
     uint32_t current_attempts;
     uint64_t total_attempts;
+    uint64_t near_misses;          // repair: refreshed matches that did not hold
 } CartRefStatus;
 
 typedef struct {
@@ -106,7 +108,7 @@ void CartRef_ListFree(CartRefList* l);
 bool CartRef_ListAdd(CartRefList* l, uint32_t sector);
 void CartRef_Count(const CartRefList* l, CartRefStatus* st);
 // Put every UNFIXABLE / SKIPPED sector back to PENDING with fresh counters
-// (for another repair round). Returns how many were reset.
+// (for another repair round). Returns how many were reset. near_miss is kept.
 uint32_t CartRef_ResetUnresolved(CartRefList* l);
 
 // Compare the given ranges of cartridge and reference, adding every differing

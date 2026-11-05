@@ -170,15 +170,15 @@ static void log_save(RefCtx* ctx) {
     static const char* names[] = { "PENDING", "FIXED", "UNFIXABLE", "SKIPPED" };
     char* w = buf;
     char* end = buf + REF_LOG_TABLE_SIZE - 64;
-    w += snprintf(w, end - w, "\n--- sectors (cart offset, state, region, attempts, stuck) ---\n");
+    w += snprintf(w, end - w, "\n--- sectors (cart offset, state, region, attempts, stuck, near misses) ---\n");
     u32 i = 0;
     for (; (i < ctx->list->count) && (i < REF_LOG_MAX_LINES) && (w < end); i++) {
         const CartRefSector* e = &ctx->list->s[i];
         u32 part = 0;
         u32 rg = sector_region(ctx, e->sector, &part);
-        w += snprintf(w, end - w, "%09llX %-9s c%lu/%-8s %6lu %4u\n",
+        w += snprintf(w, end - w, "%09llX %-9s c%lu/%-8s %6lu %4u %5lu\n",
             (unsigned long long) e->sector * CARTREF_SECTOR, names[e->state & 3], part, rg_names[rg],
-            (unsigned long) e->attempts, (unsigned) e->stuck);
+            (unsigned long) e->attempts, (unsigned) e->stuck, (unsigned long) e->near_miss);
     }
     if (i < ctx->list->count) w += snprintf(w, buf + REF_LOG_TABLE_SIZE - w, "[%lu more not listed]\n", ctx->list->count - i);
     FileSetData(ctx->log_path, buf, w - buf, ctx->log_len, false);
@@ -215,9 +215,10 @@ static void io_end_pass(void* vctx, const CartRefStatus* st) {
     bool changed = resolved != ctx->last_resolved;
     if (changed || (++ctx->quiet_passes >= REF_LOG_EVERY_PASSES)) {
         log_time(ctx);
-        log_printf(ctx, "round %lu pass %lu: remaining %lu, fixed %lu, unfixable %lu, skipped %lu, refresh reads %llu since last line (total %llu)\n",
+        log_printf(ctx, "round %lu pass %lu: remaining %lu, fixed %lu, unfixable %lu, skipped %lu, refresh reads %llu since last line (total %llu), near misses %llu\n",
             ctx->round, st->pass, st->pending, st->fixed, st->unfixable, st->skipped,
-            (unsigned long long) (st->total_attempts - ctx->attempts_before_pass), (unsigned long long) st->total_attempts);
+            (unsigned long long) (st->total_attempts - ctx->attempts_before_pass), (unsigned long long) st->total_attempts,
+            (unsigned long long) st->near_misses);
         ctx->attempts_before_pass = st->total_attempts;
         ctx->quiet_passes         = 0;
     }
@@ -263,7 +264,7 @@ static bool choose_autoretry(bool* autoretry) {
     opts[0] = last ? "Auto retry: ON (last used)" : "Auto retry: ON";
     opts[1] = last ? "Auto retry: OFF" : "Auto retry: OFF (last used)";
     u32 sel = ShowSelectPrompt(2, opts,
-        "Auto retry\n \nWhen a round ends with sectors still\nnot fixed, start another round\nautomatically after %d s?", REF_COUNTDOWN_SEC);
+        "Auto retry\n \nWhen a round ends with sectors still\nnot fixed, start the next round\nright away (B pauses at any time)?");
     if (!sel) return false;
     *autoretry = (sel == 1);
     if (*autoretry != last) save_autoretry(*autoretry);
@@ -489,7 +490,8 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     snprintf(line, sizeof(line), "Sector %08lX  attempts %-8lu   ", (unsigned long) st->current_sector,
         (unsigned long) st->current_attempts);
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
-    snprintf(line, sizeof(line), "Total refresh reads %-12llu    ", (unsigned long long) st->total_attempts);
+    snprintf(line, sizeof(line), "Refresh reads %-10llu Near miss %-6llu ", (unsigned long long) st->total_attempts,
+        (unsigned long long) st->near_misses);
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += 2 * lh;
     DrawString(MAIN_SCREEN, "B: pause (progress is saved)", x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
     DrawString(MAIN_SCREEN, "Hold Y: skip sector at retry limit", x, y, COLOR_STD_FONT, COLOR_STD_BG);
@@ -858,15 +860,10 @@ u32 FixCartWithReference(const char* cart_path) {
                 (unsigned long long) timer_sec(ctx.run_timer));
             if ((res != CARTREF_OK) || !autoretry || !(rs.unfixable + rs.skipped)) break;
 
+            // next round straight away: a 10 s countdown every ~3 minutes only
+            // cost time, and B still pauses the repair at any moment
             save_state(&ctx);
             log_save(&ctx);
-            char msg[160];
-            snprintf(msg, sizeof(msg), "Round %lu finished.\n \nFixed: %lu\nNot fixed yet: %lu", ctx.round,
-                rs.fixed, rs.unfixable + rs.skipped);
-            if (!countdown(msg, "Next round")) {
-                log_printf(&ctx, "auto retry cancelled by user\n");
-                break;
-            }
             CartRef_ResetUnresolved(&list);
         }
         ctx.run_timer = total_timer; // the final summary reports the total time

@@ -124,6 +124,10 @@ static void test_scan_and_repair(void) {
     CHECK(find(&l, 5999)->state == CARTREF_FIXED);
     CHECK(find(&l, 3000)->state == CARTREF_UNFIXABLE);
     CHECK(find(&l, 4000)->state == CARTREF_SKIPPED);   // never stable on plain reads
+    // every refreshed read of the flaky sector matched, then failed confirmation
+    CHECK(find(&l, 4000)->near_miss == find(&l, 4000)->attempts);
+    CHECK(find(&l, 3000)->near_miss == 0 && find(&l, 2047)->near_miss == 0);
+    uint32_t flaky_near = find(&l, 4000)->near_miss;
     // stuck sector gave up after stuck_limit identical reads, not 200
     CHECK(find(&l, 3000)->attempts <= 12);
     // RECOVER needing 40 refreshes: fixed after ~40 attempts across passes
@@ -131,6 +135,7 @@ static void test_scan_and_repair(void) {
     CHECK(end_passes == m->passes);
     // another round: unresolved sectors go back to PENDING with fresh counters
     CHECK(CartRef_ResetUnresolved(&l) == 2);
+    CHECK(find(&l, 4000)->near_miss == flaky_near);    // kept across rounds
     CHECK(find(&l, 3000)->state == CARTREF_PENDING && find(&l, 3000)->attempts == 0 && find(&l, 3000)->stuck == 0);
     CHECK(find(&l, 4000)->state == CARTREF_PENDING);
     CHECK(find(&l, 100)->state == CARTREF_FIXED);
