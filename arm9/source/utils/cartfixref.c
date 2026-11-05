@@ -865,11 +865,23 @@ u32 FixCartWithReference(const char* cart_path) {
         log_printf(&ctx, "unresolved by region:\n");
         log_distribution(&ctx, &list, true);
     }
-    // everything fixed: nothing left to retry, power off after a countdown
+    // everything fixed: verify the cartridge, log the result, power off after a countdown
     if ((res == CARTREF_OK) && !st.pending && !st.unfixable && !st.skipped) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "All %lu sectors fixed.\nRun Verify after the restart.", st.fixed);
-        log_printf(&ctx, "all sectors fixed, power off countdown\n");
+        log_time(&ctx);
+        log_printf(&ctx, "all sectors fixed, verifying the cartridge\n");
+        log_save(&ctx);
+        char vmsg[256];
+        u64 vtimer = timer_start();
+        u32 vres   = VerifyCartQuiet(cart_path, vmsg, sizeof(vmsg));
+        ClearScreenF(true, false, COLOR_STD_BG);
+        for (char* c = vmsg; *c; c++) if (*c == '\n') *c = ' '; // one log line
+        log_time(&ctx);
+        log_printf(&ctx, "verify: %s (%s, %llu s)\n", vres ? "FAILED" : "OK", vmsg,
+            (unsigned long long) timer_sec(vtimer));
+        char msg[160];
+        snprintf(msg, sizeof(msg), "All %lu sectors fixed.\n \nVerify: %s", st.fixed,
+            vres ? "FAILED (see the log)" : "successful");
+        log_printf(&ctx, "power off countdown\n");
         log_save(&ctx);
         if (countdown_secs(msg, "Power off", REF_SHUTDOWN_SEC)) {
             ref_close(ref);

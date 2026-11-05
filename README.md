@@ -43,7 +43,7 @@ Everything from the original Cartridge Fixer 2.00 is unchanged and still availab
 - 正常な `.3ds`（暗号化・復号済みどちらでも可）か、`.crh` ハッシュファイルと照合し、違うセクタだけをリフレッシュしながら読み直します。
 - `.crh` はPC（`tools/make_crh.py`）か、正常なカートリッジ（「Create reference hash (.crh)」）から作れます。`SD:/luma/payloads/hash/` に置くと選びやすくなります。
 - 中断・再開、スキャン後の自動開始、自動リトライ、残り時間の目安、ラウンドごとの修復数の表示に対応しています。
-- すべてのセクタが直ったら、ログを保存して30秒後に電源を切ります（A：すぐ切る、B：取り消し）。
+- すべてのセクタが直ったら、自動でVerifyして結果をログに記録し、30秒後に電源を切ります（A：すぐ切る、B：取り消し）。
 - ログは `SD:/luma/payloads/log/` に保存されます。
 - `.crh` や `.3ds` は他人と共有しないでください。
 
@@ -184,7 +184,7 @@ Why it is faster: the classic fixer can only check data against the game's own h
 
 - After the scan, the repair starts automatically after 10 seconds (A: start now, B: cancel).
 - **Auto retry** (chosen before each run, remembered): when a round ends with sectors still unfixable or skipped, they are reset and a new round starts automatically after 10 seconds.
-- When every sector has been fixed (nothing left to retry), the console powers off after 30 seconds (A: now, B: cancel). The log is saved first.
+- When every sector has been fixed (nothing left to retry), the cartridge is verified automatically (same check as GodMode9's Verify, without prompts), the result is written to the log, and the console powers off after 30 seconds (A: now, B: cancel).
 - The screen shows a rough estimate of the time left, based on how fast sectors have been resolved so far.
 - The two bottom rows show how many sectors each round fixed (newest 10; `*` = the running round).
 - **B** pauses. Progress is saved to `SD:/gm9/out/cartref_<titleid>.dat` after every pass; run the option again to resume.

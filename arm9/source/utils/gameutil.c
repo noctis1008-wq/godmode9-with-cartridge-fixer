@@ -120,6 +120,13 @@ void FixerCfg_Save(const FixerConfig* cfg) {
 #define FIXER_READ_FAILS_FORGIVE_AFTER 200
 static bool cart_stopped = false;
 
+// Quiet verify (used by the reference fixer to verify unattended): failure
+// messages go into verify_msg instead of a blocking prompt.
+static bool verify_quiet = false;
+static char verify_msg[256];
+#define VerifyPrompt(ask, ...) (verify_quiet ? \
+    (snprintf(verify_msg, sizeof(verify_msg), __VA_ARGS__), false) : ShowPrompt(ask, __VA_ARGS__))
+
 extern int refresh_call_every;
 
 // Fix-report bounds while logging (NULL otherwise). `log_end` is the append
@@ -1178,7 +1185,7 @@ u32 VerifyNcchFile(const char* path, u32 offset, u32 size, bool sig_check) {
         u32 gh = GetNcchHeaders(&ncch, NULL, NULL, &file, cryptofix);
         if (gh == 2) { fvx_close(&file); cart_stopped = true; return 2; }
         if (gh != 0) {
-            if (!offset) ShowPrompt(false, "%s\n%s", pathstr, STR_ERROR_NOT_NCCH_FILE);
+            if (!offset) VerifyPrompt(false, "%s\n%s", pathstr, STR_ERROR_NOT_NCCH_FILE);
             fvx_close(&file);
             return 1;
         }
@@ -1187,7 +1194,7 @@ u32 VerifyNcchFile(const char* path, u32 offset, u32 size, bool sig_check) {
     // check NCCH size
     if (!size) size = fvx_size(&file) - offset;
     if ((fvx_size(&file) < offset) || (size < ncch.size * NCCH_MEDIA_UNIT)) {
-        if (!offset) ShowPrompt(false, "%s\n%s", pathstr, STR_ERROR_FILE_IS_TOO_SMALL);
+        if (!offset) VerifyPrompt(false, "%s\n%s", pathstr, STR_ERROR_FILE_IS_TOO_SMALL);
         fvx_close(&file);
         return 1;
     }
@@ -1211,7 +1218,7 @@ u32 VerifyNcchFile(const char* path, u32 offset, u32 size, bool sig_check) {
             }
         }
         if (!borkedflags) {
-            if (!offset) ShowPrompt(false, "%s\n%s", pathstr, STR_ERROR_BAD_EXEFS_HEADER);
+            if (!offset) VerifyPrompt(false, "%s\n%s", pathstr, STR_ERROR_BAD_EXEFS_HEADER);
             fvx_close(&file);
             return 1;
         }
@@ -1220,21 +1227,21 @@ u32 VerifyNcchFile(const char* path, u32 offset, u32 size, bool sig_check) {
     // fetch and check ExtHeader
     fvx_lseek(&file, offset);
     if (ncch.size_exthdr && (GetNcchHeaders(&ncch, &exthdr, NULL, &file, cryptofix) != 0)) {
-        if (!offset) ShowPrompt(false, "%s\n%s", pathstr, STR_ERROR_MISSING_EXTHEADER);
+        if (!offset) VerifyPrompt(false, "%s\n%s", pathstr, STR_ERROR_MISSING_EXTHEADER);
         fvx_close(&file);
         return 1;
     }
 
     // signature verification
     if (sig_check && ValidateNcchSignature(&ncch, ncch.size_exthdr ? &exthdr : NULL) != 0) {
-        if (!offset) ShowPrompt(false, "%s\n%s", pathstr, STR_ERROR_SIGNATURE_CHECK_FAILED);
+        if (!offset) VerifyPrompt(false, "%s\n%s", pathstr, STR_ERROR_SIGNATURE_CHECK_FAILED);
         fvx_close(&file);
         return 1;
     }
 
     // check / setup crypto
     if (SetupNcchCrypto(&ncch, NCCH_NOCRYPTO) != 0) {
-        if (!offset) ShowPrompt(false, "%s\n%s", pathstr, STR_ERROR_CRYPTO_NOT_SET_UP);
+        if (!offset) VerifyPrompt(false, "%s\n%s", pathstr, STR_ERROR_CRYPTO_NOT_SET_UP);
         fvx_close(&file);
         return 1;
     }
@@ -1367,7 +1374,7 @@ u32 VerifyNcchFile(const char* path, u32 offset, u32 size, bool sig_check) {
     if (cart_stopped) { fvx_close(&file); return 2; }
 
     if (!offset && (ver_exthdr|ver_exefs|ver_romfs)) { // verification summary
-        ShowPrompt(false, STR_PATH_NCCH_VERIFICATION_FAILED_INFO, pathstr,
+        VerifyPrompt(false, STR_PATH_NCCH_VERIFICATION_FAILED_INFO, pathstr,
             (!ncch.size_exthdr) ? "-" : (ver_exthdr == 0) ? STR_OK : STR_FAIL,
             (!ncch.size_exefs) ? "-" : (ver_exefs == 0) ? STR_OK : STR_FAIL,
             (!ncch.size_romfs) ? "-" : (ver_romfs == 0) ? STR_OK : STR_FAIL);
@@ -1499,13 +1506,13 @@ u32 VerifyNcsdFile(const char* path, bool sig_check) {
 
     // load NCSD header
     if (LoadNcsdHeader(&ncsd, path) != 0) {
-        ShowPrompt(false, "%s\n%s", pathstr, STR_ERROR_NOT_NCSD_FILE);
+        VerifyPrompt(false, "%s\n%s", pathstr, STR_ERROR_NOT_NCSD_FILE);
         return 1;
     }
 
     // signature verification
     if (sig_check && ValidateNcsdSignature(&ncsd) != 0) {
-        ShowPrompt(false, "%s\n%s", pathstr, STR_ERROR_SIGNATURE_CHECK_FAILED);
+        VerifyPrompt(false, "%s\n%s", pathstr, STR_ERROR_SIGNATURE_CHECK_FAILED);
         return 1;
     }
 
@@ -1517,10 +1524,10 @@ u32 VerifyNcsdFile(const char* path, bool sig_check) {
         if (!size) continue;
         if (VerifyNcchFile(path, offset, size, sig_check) != 0) {
             if (cart_stopped) {
-                ShowPrompt(false, "%s\nCartridge stopped responding.\nIt may be failing or dead.\nReseat it and try again.", pathstr);
+                VerifyPrompt(false, "%s\nCartridge stopped responding.\nIt may be failing or dead.\nReseat it and try again.", pathstr);
                 return 2;
             }
-            ShowPrompt(false, STR_PATH_CONTENT_N_SIZE_AT_OFFSET_VERIFICATION_FAILED,
+            VerifyPrompt(false, STR_PATH_CONTENT_N_SIZE_AT_OFFSET_VERIFICATION_FAILED,
                 pathstr, i, size, offset);
             return 1;
         }
@@ -1944,6 +1951,18 @@ u32 LoadNcchFromGameFile(const char* path, NcchHeader* ncch, NcchExtHeader* exth
     }
 
     return 1;
+}
+
+u32 VerifyCartQuiet(const char* path, char* msg, size_t msglen) {
+    verify_quiet  = true;
+    verify_msg[0] = '\0';
+    cart_stopped  = false;
+    u32 res       = VerifyNcsdFile(path, false);
+    verify_quiet  = false;
+    if (msg && msglen) {
+        snprintf(msg, msglen, "%s", res ? (verify_msg[0] ? verify_msg : "verification failed") : "Verify successful");
+    }
+    return res;
 }
 
 u32 VerifyGameFile(const char* path, bool sig_check) {

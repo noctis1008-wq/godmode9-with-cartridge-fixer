@@ -3,6 +3,9 @@
 #include "common.h"
 
 u32 VerifyGameFile(const char* path, bool sig_check);
+// Verify an NCSD (e.g. the cartridge) without blocking prompts; `msg` gets the
+// result text. Returns 0 when it verifies.
+u32 VerifyCartQuiet(const char* path, char* msg, size_t msglen);
 u32 CheckEncryptedGameFile(const char* path);
 u32 CryptGameFile(const char* path, bool inplace, bool encrypt, bool restore);
 u32 BuildCiaFromGameFile(const char* path, bool force_legit);
