@@ -481,7 +481,8 @@ static void io_status(void* vctx, const CartRefStatus* st) {
             (unsigned long) ((eta / 60) % 60), (unsigned long) (eta % 60));
     } else snprintf(line, sizeof(line), "Est. left  estimating...          ");
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
-    snprintf(line, sizeof(line), "Fixed      %-10lu              ", (unsigned long) st->fixed);
+    snprintf(line, sizeof(line), "Fixed      %-6lu (this round %lu)        ", (unsigned long) st->fixed,
+        (unsigned long) (st->fixed - ctx->fixed_at_round_start));
     DrawString(MAIN_SCREEN, line, x, y, COLOR_GREEN, COLOR_STD_BG); y += lh;
     snprintf(line, sizeof(line), "Unfixable  %-10lu              ", (unsigned long) st->unfixable);
     DrawString(MAIN_SCREEN, line, x, y, COLOR_RED, COLOR_STD_BG); y += lh;
