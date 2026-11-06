@@ -24,21 +24,25 @@
 #define CARTREF_WAIT_MS     5u       // "wait" strategy: pause between refresh and read
 #define CARTREF_WIDE        8u       // "wide" strategy: read the aligned 4 KB block around the run
 
-// Read strategies, tried in turn on every attempt when CartRefParams.experiment
-// is set, with their success counted separately (CartRefList.strat).
+// Read strategies. Each attempt uses one of them; their time shares adapt to
+// how well each works on the cartridge (see CartRef_StrategyShares).
 enum {
     CARTREF_STRAT_NORMAL = 0, // refresh + read of the run
     CARTREF_STRAT_WIDE,       // refresh + read of the whole aligned 4 KB block
     CARTREF_STRAT_WAIT,       // refresh, wait CARTREF_WAIT_MS, plain read
     CARTREF_STRAT_DOUBLE,     // extra refresh, then refresh + read
+    CARTREF_STRAT_SINGLE,     // refresh + read of one sector of the run alone
+    CARTREF_STRAT_STREAM,     // one refresh, then up to 8 plain reads
     CARTREF_STRATS
 };
+#define CARTREF_STRATS_ALL ((1u << CARTREF_STRATS) - 1)
 
 typedef struct {
     uint64_t attempts;    // refreshed reads with this strategy
     uint64_t near_misses; // ... that matched but failed confirmation (per sector)
     uint32_t fixed;       // sectors fixed by it
     uint64_t msec;        // time spent (attempt + confirmation), if io->msec is set
+    uint32_t reserved;
 } CartRefStratStats;
 
 typedef enum {
@@ -79,7 +83,7 @@ typedef struct {
     uint32_t confirm_reads;       // matching plain reads required to call it fixed
     uint32_t cold_every;          // visit runs without near misses every Nth pass (0/1: every pass)
     uint32_t near_burst;          // extra attempts after a near miss (0: none)
-    bool experiment;              // rotate the read strategies (needs the optional io calls)
+    uint32_t strategies;          // bit mask of CARTREF_STRAT_* to use (bit 0 alone: normal only)
 } CartRefParams;
 
 typedef enum {
@@ -157,6 +161,10 @@ CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint
 // limit counts passes (retries_before_skip / attempts_per_visit), so every
 // sector of a round reaches it at the same time.
 CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRefList* list);
+
+// Current time share (0..1) of every read strategy, from the statistics in
+// list->strat (unusable or disabled strategies get 0).
+void CartRef_StrategyShares(const CartRefIo* io, const CartRefParams* p, const CartRefList* l, double* share);
 
 // Resume state (serialised list of unresolved sectors).
 typedef struct {

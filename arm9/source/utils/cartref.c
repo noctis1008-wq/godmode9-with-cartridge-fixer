@@ -15,7 +15,7 @@ void CartRef_DefaultParams(CartRefParams* p) {
     p->confirm_reads = 5;
     p->cold_every = CARTREF_COLD_EVERY;
     p->near_burst = CARTREF_NEAR_BURST;
-    p->experiment = true;
+    p->strategies = CARTREF_STRATS_ALL;
 }
 
 bool CartRef_ListInit(CartRefList* l, uint32_t capacity) {
@@ -129,18 +129,167 @@ CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint
     return CARTREF_OK;
 }
 
-/* One repair attempt on `n` neighbouring sectors list->s[first..first+n): a
- * single refresh + read covers them all. The card's error correction works on
- * blocks of about 1 KB, and real logs show bad sectors in adjacent pairs that
- * recover together, so one command for the run gives each sector the same
- * chance at a fraction of the commands. */
+/* ---- read strategies and how they are chosen ----
+ *
+ * Every attempt reads the bad sectors in one of several ways (CARTREF_STRAT_*).
+ * Which way works best differs between cartridges, so the time is shared out
+ * adaptively: each strategy's yield is measured as sectors fixed plus near
+ * misses converted to "fix equivalents" (at the rate near misses turn into
+ * fixes overall), per second spent. Each strategy's figure is blended with the
+ * overall average, weighted like 1/16 of an average strategy's time (at
+ * least CARTREF_STRAT_PRIOR_MIN), so little data means "about average". The best strategies get most of the time (share grows with
+ * the square of the yield), but every strategy keeps at least
+ * CARTREF_STRAT_FLOOR of it, so a change (e.g. the easy sectors are done) is
+ * noticed. The caller may preload the statistics learned on earlier cartridges
+ * (CartRefList.strat) as a starting point. */
+
+#define CARTREF_STRAT_FLOOR   0.03   /* minimum time share per strategy */
+#define CARTREF_STRAT_PRIOR_MIN 10.0 /* minimum weight of the "average" assumption (s, or k-attempts) */
+#define CARTREF_STREAM_READS  8u     /* plain reads after one refresh ("stream") */
+
+static bool strat_usable(const CartRefIo* io, uint32_t s) {
+    switch (s) {
+        case CARTREF_STRAT_WAIT:   return io->refresh_only && io->wait_ms;
+        case CARTREF_STRAT_DOUBLE:
+        case CARTREF_STRAT_STREAM: return io->refresh_only != NULL;
+        default:                   return true;
+    }
+}
+
+/* cost unit: seconds with a clock, else thousands of attempts */
+static double strat_cost(const CartRefIo* io, const CartRefStratStats* s) {
+    return io->msec ? (double) s->msec / 1000.0 : (double) s->attempts / 1000.0;
+}
+
+void CartRef_StrategyShares(const CartRefIo* io, const CartRefParams* p, const CartRefList* l, double* share) {
+    double F = 0, N = 0, T = 0;
+    uint32_t usable = 0;
+    for (uint32_t i = 0; i < CARTREF_STRATS; i++) {
+        share[i] = 0;
+        if (!strat_usable(io, i) || !(p->strategies & (1u << i))) continue;
+        usable++;
+        F += l->strat[i].fixed;
+        N += (double) l->strat[i].near_misses;
+        T += strat_cost(io, &l->strat[i]);
+    }
+    if (!usable) return;
+    double K = (N + 1.0) / (F + 1.0);          /* near misses per fix, overall */
+    if (K < 20.0) K = 20.0;
+    double mean = (T > 0) ? (F + N / K) / T : 0; /* fix equivalents per second, overall */
+    double t0 = T / (16.0 * usable);
+    if (t0 < CARTREF_STRAT_PRIOR_MIN) t0 = CARTREF_STRAT_PRIOR_MIN;
+    double score[CARTREF_STRATS], sum = 0;
+    for (uint32_t i = 0; i < CARTREF_STRATS; i++) {
+        score[i] = 0;
+        if (!strat_usable(io, i) || !(p->strategies & (1u << i))) continue;
+        const CartRefStratStats* s = &l->strat[i];
+        double e = s->fixed + (double) s->near_misses / K;
+        double t = strat_cost(io, s);
+        score[i] = (e + mean * t0) / (t + t0);
+        score[i] *= score[i];
+        sum += score[i];
+    }
+    double floor = (usable > 1) ? CARTREF_STRAT_FLOOR : 1.0;
+    double rest = 1.0 - floor * usable;
+    for (uint32_t i = 0; i < CARTREF_STRATS; i++) {
+        if (!strat_usable(io, i) || !(p->strategies & (1u << i))) continue;
+        share[i] = floor + ((sum > 0) ? rest * score[i] / sum : rest / usable);
+    }
+}
+
+/* the strategy furthest behind its time share */
+static uint32_t strat_pick(const CartRefIo* io, const CartRefParams* p, const CartRefList* l, const double* share) {
+    double total = 0;
+    for (uint32_t i = 0; i < CARTREF_STRATS; i++)
+        if (share[i] > 0) total += strat_cost(io, &l->strat[i]);
+    uint32_t best = CARTREF_STRAT_NORMAL;
+    double best_def = -1e300;
+    for (uint32_t i = 0; i < CARTREF_STRATS; i++) {
+        if (share[i] <= 0) continue;
+        double def = share[i] * total - strat_cost(io, &l->strat[i]);
+        if (def > best_def) { best_def = def; best = i; }
+    }
+    (void) p;
+    return best;
+}
+
+/* One refreshed read of the run list->s[first..first+n) the way strategy `sidx`
+ * does it. On success `data` points at the n sectors read (only those with
+ * cover[k] set are meaningful) and match[] tells which of them are correct.
+ * Returns 0, 1 on a read error, or -1 on a reference error. `sidx` may be
+ * changed to the strategy actually used (wide falls back to normal). */
+static int strat_attempt(const CartRefIo* io, uint32_t* sidx, CartRefSector* run, uint32_t n,
+                         uint8_t* cbuf, uint8_t* wbuf, const uint8_t** data, uint8_t* match, uint8_t* cover) {
+    static uint32_t single_next = 0;
+    uint32_t first = run[0].sector;
+    for (uint32_t k = 0; k < n; k++) { cover[k] = (run[k].state == CARTREF_PENDING); match[k] = 0; }
+    *data = cbuf;
+    int rr = 1;
+
+    if (*sidx == CARTREF_STRAT_WIDE) {
+        uint32_t ws = first & ~(CARTREF_WIDE - 1);
+        uint32_t we = ((first + n - 1) | (CARTREF_WIDE - 1)) + 1;
+        rr = io->cart_read(io->ctx, ws, we - ws, wbuf, true);
+        if (!rr) *data = wbuf + (size_t) (first - ws) * CARTREF_SECTOR;
+        else *sidx = CARTREF_STRAT_NORMAL; /* e.g. past the end of the card */
+    }
+    switch (*sidx) {
+        case CARTREF_STRAT_WIDE:
+            break;
+        case CARTREF_STRAT_WAIT:
+            rr = io->refresh_only(io->ctx);
+            if (!rr) {
+                io->wait_ms(io->ctx, CARTREF_WAIT_MS);
+                rr = io->cart_read(io->ctx, first, n, cbuf, false);
+            }
+            break;
+        case CARTREF_STRAT_DOUBLE:
+            rr = io->refresh_only(io->ctx);
+            if (!rr) rr = io->cart_read(io->ctx, first, n, cbuf, true);
+            break;
+        case CARTREF_STRAT_SINGLE: {
+            /* one pending sector of the run on its own */
+            uint32_t k = single_next++ % n, t;
+            for (t = 0; (t < n) && (run[k].state != CARTREF_PENDING); t++) k = (k + 1) % n;
+            for (uint32_t j = 0; j < n; j++) cover[j] = (j == k);
+            rr = io->cart_read(io->ctx, first + k, 1, cbuf + (size_t) k * CARTREF_SECTOR, true);
+            if (rr) return rr;
+            if (io->ref_compare(io->ctx, first + k, 1, cbuf + (size_t) k * CARTREF_SECTOR, &match[k]) != 0) return -1;
+            return 0;
+        }
+        case CARTREF_STRAT_STREAM: {
+            /* one refresh, then plain reads: any correct one is a candidate */
+            rr = io->refresh_only(io->ctx);
+            if (rr) return rr;
+            uint8_t mm[CARTREF_RUN_MAX];
+            for (uint32_t r = 0; r < CARTREF_STREAM_READS; r++) {
+                rr = io->cart_read(io->ctx, first, n, cbuf, false);
+                if (rr) return rr;
+                if (io->ref_compare(io->ctx, first, n, cbuf, mm) != 0) return -1;
+                bool any = false;
+                for (uint32_t k = 0; k < n; k++) { match[k] |= mm[k]; any |= (mm[k] && cover[k]); }
+                if (any) break; /* keep this read: confirmation follows */
+            }
+            return 0;
+        }
+        default:
+            rr = io->cart_read(io->ctx, first, n, cbuf, true);
+            break;
+    }
+    if (rr) return rr;
+    if (io->ref_compare(io->ctx, first, n, *data, match) != 0) return -1;
+    return 0;
+}
+
+/* Bad sectors are worked on in runs of up to CARTREF_RUN_MAX neighbours: the
+ * card's error correction works on blocks of about 1 KB, and real logs show bad
+ * sectors in adjacent pairs that recover together. */
 CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRefList* list) {
     static uint8_t cbuf[CARTREF_RUN_MAX * CARTREF_SECTOR]; /* the refreshed read (static: keep it off the small ARM9 stack) */
     static uint8_t vbuf[CARTREF_RUN_MAX * CARTREF_SECTOR]; /* confirmation reads */
     static uint8_t wbuf[2 * CARTREF_WIDE * CARTREF_SECTOR]; /* "wide" reads (a run may cross a block) */
-    static uint32_t strat_next = 0;
-    uint8_t m[CARTREF_RUN_MAX];
-    uint8_t cand[CARTREF_RUN_MAX];
+    uint8_t m[CARTREF_RUN_MAX], cand[CARTREF_RUN_MAX], cover[CARTREF_RUN_MAX];
+    double share[CARTREF_STRATS];
     uint32_t apv = p->attempts_per_visit ? p->attempts_per_visit : 1;
     int read_fails = 0;
 
@@ -164,6 +313,8 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
         bool cold_pass = !any_hot || (p->cold_every <= 1) || ((st.pass % p->cold_every) == 1);
         /* round-relative attempt budget: the skip limit is reached by every sector at the same pass */
         bool at_limit = (uint64_t) st.pass * apv >= p->retries_before_skip;
+        /* time shares of the read strategies, updated once per pass */
+        if (p->strategies & ~1u) CartRef_StrategyShares(io, p, list, share);
 
         uint32_t i = 0;
         while (i < list->count) {
@@ -190,47 +341,21 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                 return CARTREF_ABORTED;
 
             uint32_t limit = apv;
+            int sticky = -1; /* after a near miss, the burst keeps the strategy that got it */
             for (uint32_t a = 0; a < limit; a++) {
                 uint32_t open = 0;
                 for (uint32_t k = 0; k < n; k++)
                     open += (run[k].state == CARTREF_PENDING);
                 if (!open) break;
 
-                /* pick the read strategy (rotating, skipping those the io cannot do) */
                 uint32_t sidx = CARTREF_STRAT_NORMAL;
-                if (p->experiment) {
-                    for (uint32_t t = 0; t < CARTREF_STRATS; t++) {
-                        uint32_t c = strat_next++ % CARTREF_STRATS;
-                        if (((c == CARTREF_STRAT_WAIT) && (!io->refresh_only || !io->wait_ms)) ||
-                            ((c == CARTREF_STRAT_DOUBLE) && !io->refresh_only))
-                            continue;
-                        sidx = c;
-                        break;
-                    }
-                }
+                if (sticky >= 0) sidx = (uint32_t) sticky;
+                else if (p->strategies & ~1u) sidx = strat_pick(io, p, list, share);
                 uint32_t t0 = io->msec ? io->msec(io->ctx) : 0;
-                const uint8_t* data = cbuf;
-                int rr = 1;
-                if (sidx == CARTREF_STRAT_WIDE) {
-                    uint32_t ws = first & ~(CARTREF_WIDE - 1);
-                    uint32_t we = ((first + n - 1) | (CARTREF_WIDE - 1)) + 1;
-                    rr = io->cart_read(io->ctx, ws, we - ws, wbuf, true);
-                    if (!rr) data = wbuf + (size_t) (first - ws) * CARTREF_SECTOR;
-                    else sidx = CARTREF_STRAT_NORMAL; /* e.g. past the end of the card: plain attempt instead */
-                }
-                if (sidx == CARTREF_STRAT_WAIT) {
-                    rr = io->refresh_only(io->ctx);
-                    if (!rr) {
-                        io->wait_ms(io->ctx, CARTREF_WAIT_MS);
-                        rr = io->cart_read(io->ctx, first, n, cbuf, false);
-                    }
-                } else if (sidx == CARTREF_STRAT_DOUBLE) {
-                    rr = io->refresh_only(io->ctx);
-                    if (!rr) rr = io->cart_read(io->ctx, first, n, cbuf, true);
-                } else if (sidx == CARTREF_STRAT_NORMAL) {
-                    rr = io->cart_read(io->ctx, first, n, cbuf, true);
-                }
-                if (rr != 0) {
+                const uint8_t* data;
+                int rr = strat_attempt(io, &sidx, run, n, cbuf, wbuf, &data, m, cover);
+                if (rr < 0) return CARTREF_REF_ERROR;
+                if (rr) {
                     if (++read_fails >= CARTREF_MAX_READ_FAILS) return CARTREF_CART_ERROR;
                     continue;
                 }
@@ -238,13 +363,11 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                 st.total_attempts++;
                 CartRefStratStats* ss = &list->strat[sidx];
                 ss->attempts++;
-                if (io->ref_compare(io->ctx, first, n, data, m) != 0)
-                    return CARTREF_REF_ERROR;
 
                 /* matches get confirmed with plain reads (no refresh) */
                 uint32_t ncand = 0;
                 for (uint32_t k = 0; k < n; k++) {
-                    cand[k] = (run[k].state == CARTREF_PENDING) && m[k];
+                    cand[k] = cover[k] && (run[k].state == CARTREF_PENDING) && m[k];
                     ncand += cand[k];
                 }
                 bool readerr = false;
@@ -268,25 +391,25 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
 
                 for (uint32_t k = 0; k < n; k++) {
                     CartRefSector* s = &run[k];
-                    if (s->state != CARTREF_PENDING) continue;
+                    if ((s->state != CARTREF_PENDING) || !cover[k]) continue;
                     s->attempts++;
-                    if (m[k] && !cand[k] && !readerr) { /* matched once, then the plain reads disagreed */
-                        s->near_miss++;
-                        st.near_misses++;
-                        ss->near_misses++;
-                        /* close to recovering: keep at it for a while */
-                        if (p->near_burst) {
-                            uint32_t want = a + 1 + p->near_burst;
-                            if (want > CARTREF_BURST_MAX) want = CARTREF_BURST_MAX;
-                            if (want > limit) limit = want;
-                        }
-                    }
                     if (cand[k] && !readerr) {
                         s->state = CARTREF_FIXED;
                         ss->fixed++;
                         continue;
                     }
-                    if (!m[k]) { /* a match that did not hold is no evidence of being stuck */
+                    if (m[k] && !readerr) { /* matched once, then the plain reads disagreed */
+                        s->near_miss++;
+                        st.near_misses++;
+                        ss->near_misses++;
+                        /* close to recovering: keep at it for a while, the same way */
+                        if (p->near_burst) {
+                            uint32_t want = a + 1 + p->near_burst;
+                            if (want > CARTREF_BURST_MAX) want = CARTREF_BURST_MAX;
+                            if (want > limit) limit = want;
+                            sticky = (int) sidx;
+                        }
+                    } else if (!m[k]) { /* a match that did not hold is no evidence of being stuck */
                         uint32_t sum = sector_sum(&data[(size_t) k * CARTREF_SECTOR]);
                         if ((s->attempts > 1) && (sum == s->last_sum)) {
                             s->stuck++;
@@ -295,14 +418,18 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                             s->last_sum = sum;
                         }
                     }
-                    if (p->stuck_limit && (s->stuck >= p->stuck_limit)) {
+                    if (p->stuck_limit && (s->stuck >= p->stuck_limit))
                         s->state = CARTREF_UNFIXABLE;
-                    } else if (at_limit) {
-                        if (p->autoskip || (io->poll_skip && io->poll_skip(io->ctx)))
-                            s->state = CARTREF_SKIPPED;
-                    }
                 }
                 if (io->msec) ss->msec += (uint32_t) (io->msec(io->ctx) - t0);
+            }
+            /* retry limit (counted in passes): skip what is left of the run */
+            if (at_limit) {
+                for (uint32_t k = 0; k < n; k++) {
+                    if (run[k].state != CARTREF_PENDING) continue;
+                    if (p->autoskip || (io->poll_skip && io->poll_skip(io->ctx)))
+                        run[k].state = CARTREF_SKIPPED;
+                }
             }
 
             st.current_sector = first;

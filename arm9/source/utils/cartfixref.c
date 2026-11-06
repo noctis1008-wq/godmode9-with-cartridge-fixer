@@ -78,6 +78,8 @@ typedef struct {
     char log_path[96];
     CartRefList* list;
     const CartRefResumeHeader* rhdr;
+    const CartRefIo* io;          // for the strategy shares on screen and in the log
+    const CartRefParams* params;
     const char* state_file;
     u64 pass_timer;
     u64 attempts_before_pass;
@@ -185,8 +187,47 @@ static void log_save(RefCtx* ctx) {
     free(buf);
 }
 
+// What the read strategies achieved, carried over to the next cartridge as a
+// starting point (scaled down so the new cartridge's own results soon rule).
+#define REF_LEARN_FILE   OUTPUT_PATH "/reffix_learn.dat"
+#define REF_LEARN_MAGIC  0x4E524C52u  // "RLRN"
+#define REF_LEARN_MAX_MS (10ull * 60 * 1000) // at most 10 minutes' worth of old results
+
+typedef struct {
+    u32 magic, count;
+    CartRefStratStats s[CARTREF_STRATS];
+} RefLearn;
+
+static void learn_load(CartRefList* list) {
+    RefLearn lr;
+    if ((FileGetData(REF_LEARN_FILE, &lr, sizeof(lr), 0) != sizeof(lr)) ||
+        (lr.magic != REF_LEARN_MAGIC) || (lr.count != CARTREF_STRATS)) return;
+    u64 total = 0;
+    for (u32 i = 0; i < CARTREF_STRATS; i++) total += lr.s[i].msec;
+    for (u32 i = 0; i < CARTREF_STRATS; i++) {
+        CartRefStratStats* d = &list->strat[i];
+        *d = lr.s[i];
+        if (total > REF_LEARN_MAX_MS) { // keep the ratios, shrink the weight
+            d->msec        = d->msec * REF_LEARN_MAX_MS / total;
+            d->attempts    = d->attempts * REF_LEARN_MAX_MS / total;
+            d->near_misses = d->near_misses * REF_LEARN_MAX_MS / total;
+            d->fixed       = (u32) ((u64) d->fixed * REF_LEARN_MAX_MS / total);
+        }
+    }
+}
+
+static void learn_save(const CartRefList* list) {
+    RefLearn lr;
+    lr.magic = REF_LEARN_MAGIC;
+    lr.count = CARTREF_STRATS;
+    memcpy(lr.s, list->strat, sizeof(lr.s));
+    fvx_rmkdir(OUTPUT_PATH);
+    FileSetData(REF_LEARN_FILE, &lr, sizeof(lr), 0, true);
+}
+
 static bool save_state(RefCtx* ctx) {
     if (!ctx->list || !ctx->rhdr || !ctx->state_file) return false;
+    if (ctx->io) learn_save(ctx->list); // only once repairing (io set)
     CartRefStatus st;
     CartRef_Count(ctx->list, &st);
     if (!st.pending && !st.unfixable && !st.skipped) {
@@ -307,18 +348,20 @@ static u32 io_msec(void* vctx) {
     return (u32) timer_msec(io_clock);
 }
 
-// one log line per read strategy: how often it was used and what it achieved
+static const char* strat_name[CARTREF_STRATS] = { "normal", "wide 4KB", "wait 5ms", "refresh x2", "single", "stream" };
+
+// one log line per read strategy: how often it was used, what it achieved, its time share now
 static void log_strats(RefCtx* ctx) {
-    static const char* sname[CARTREF_STRATS] = { "normal", "wide 4KB", "wait 5ms", "refresh x2" };
-    if (!ctx->list) return;
+    if (!ctx->list || !ctx->io || !ctx->params) return;
+    double share[CARTREF_STRATS];
+    CartRef_StrategyShares(ctx->io, ctx->params, ctx->list, share);
     for (u32 i = 0; i < CARTREF_STRATS; i++) {
         const CartRefStratStats* s = &ctx->list->strat[i];
         if (!s->attempts) continue;
-        u64 sec = s->msec / 1000;
-        log_printf(ctx, "  strategy %-10s: %llu attempts, %llu s, near misses %llu (%llu per 10k attempts), fixed %lu\n",
-            sname[i], (unsigned long long) s->attempts, (unsigned long long) sec,
+        log_printf(ctx, "  strategy %-10s: %llu attempts, %llu s, near misses %llu (%llu per 10k attempts), fixed %lu, share now %lu%%\n",
+            strat_name[i], (unsigned long long) s->attempts, (unsigned long long) (s->msec / 1000),
             (unsigned long long) s->near_misses, (unsigned long long) (s->near_misses * 10000 / s->attempts),
-            (unsigned long) s->fixed);
+            (unsigned long) s->fixed, (unsigned long) (share[i] * 100 + 0.5));
     }
 }
 
@@ -520,7 +563,16 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     snprintf(line, sizeof(line), "Unfixable  %-10lu              ", (unsigned long) st->unfixable);
     DrawString(MAIN_SCREEN, line, x, y, COLOR_RED, COLOR_STD_BG); y += lh;
     snprintf(line, sizeof(line), "Skipped    %-10lu              ", (unsigned long) st->skipped);
-    DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += 2 * lh;
+    DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
+    if (ctx->io && ctx->params && ctx->list) { // the read strategy getting the most time now
+        double share[CARTREF_STRATS];
+        CartRef_StrategyShares(ctx->io, ctx->params, ctx->list, share);
+        u32 b = 0;
+        for (u32 i = 1; i < CARTREF_STRATS; i++) if (share[i] > share[b]) b = i;
+        snprintf(line, sizeof(line), "Method     %-10s %3lu%%           ", strat_name[b], (unsigned long) (share[b] * 100 + 0.5));
+        DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG);
+    }
+    y += lh;
     snprintf(line, sizeof(line), "Sector %08lX  attempts %-8lu   ", (unsigned long) st->current_sector,
         (unsigned long) st->current_attempts);
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
@@ -791,7 +843,7 @@ u32 FixCartWithReference(const char* cart_path) {
             (unsigned long long) ref_size);
         log_printf(&ctx, "%s", partinfo);
         FixerCfg_Load(&fixer_cfg);
-        log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5 cold_every=%u near_burst=%u strategies=normal/wide4KB/wait%ums/refreshx2\n",
+        log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5 cold_every=%u near_burst=%u strategies=normal/wide4KB/wait%ums/refreshx2/single/stream (adaptive)\n",
             fixer_cfg.stuck_limit, fixer_cfg.retries_before_skip, fixer_cfg.autoskip ? 1 : 0,
             (unsigned) CARTREF_COLD_EVERY, (unsigned) CARTREF_NEAR_BURST, (unsigned) CARTREF_WAIT_MS); /* = the CartRef_DefaultParams values */
         if (*FixerSim_Status()) log_printf(&ctx, "SIM BUILD: %s\n", FixerSim_Status());
@@ -864,12 +916,15 @@ u32 FixCartWithReference(const char* cart_path) {
     }
 
     if (res == CARTREF_OK) {
-        CartRefParams params;
+        static CartRefParams params; // static: the log summary after this block still reads it
         CartRef_DefaultParams(&params);
         FixerCfg_Load(&fixer_cfg);  // share retry/stuck/autoskip with the classic fixer
         params.stuck_limit = fixer_cfg.stuck_limit;
         params.retries_before_skip = fixer_cfg.retries_before_skip;
         params.autoskip = fixer_cfg.autoskip;
+        learn_load(&list);   // start from what worked on earlier cartridges
+        ctx.io = &io;
+        ctx.params = &params;
 
         ClearScreenF(true, false, COLOR_STD_BG);
         CTR_ResetRefreshCount();

@@ -8,7 +8,7 @@
 
 #define NSECT 6000u
 
-typedef enum { OK = 0, RECOVER, STUCK, FLAKY, NOISE, WIDEFIX } Fault;
+typedef enum { OK = 0, RECOVER, STUCK, FLAKY, NOISE, WIDEFIX, SINGLENEAR } Fault;
 
 typedef struct {
     uint8_t* ref;
@@ -47,6 +47,9 @@ static int m_cart_read(void* ctx, uint32_t sector, uint32_t count, void* buf, bo
             case STUCK: fill_bad(o, 999); break;
             case FLAKY: if (!refresh) fill_bad(o, rnd()); break; // correct only right after refresh
             case NOISE: fill_bad(o, rnd() | 1); break;
+            case SINGLENEAR: // right only on a refreshed read of this sector alone, never sticks
+                if (!(refresh && (count == 1))) fill_bad(o, rnd() | 1);
+                break;
             case WIDEFIX: // restored for good by a refreshed read of a whole 4 KB block
                 if (refresh && (count >= 8)) m->fault[s] = OK;
                 else fill_bad(o, rnd() | 1);
@@ -119,7 +122,7 @@ static void test_scan_and_repair(void) {
 
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0; p.experiment = false; // uniform scheduling for these checks
+    p.cold_every = 1; p.near_burst = 0; p.strategies = 1; // uniform scheduling for these checks
     p.stuck_limit = 10;
     p.retries_before_skip = 200;
     p.autoskip = true;
@@ -171,7 +174,7 @@ static void test_runs_share_commands(void)
     CartRef_ListAdd(&l, 600);
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0; p.experiment = false; // uniform scheduling for these checks
+    p.cold_every = 1; p.near_burst = 0; p.strategies = 1; // uniform scheduling for these checks
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     for (s = 0; s < 5; s++) CHECK(l.s[s].state == CARTREF_FIXED);
     printf("runs: %u refreshing commands for 5 sectors\n", m->refreshes);
@@ -192,7 +195,7 @@ static void test_near_miss_priority(void) {
     CartRefParams p;
     CartRef_DefaultParams(&p);
     p.retries_before_skip = 400; // 100 passes of 4
-    p.experiment = false;
+    p.strategies = 1;
     p.autoskip = true;
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     CHECK(find(&l, 100)->state == CARTREF_SKIPPED && find(&l, 500)->state == CARTREF_SKIPPED);
@@ -209,7 +212,7 @@ static int s_refresh_only(void* ctx) { ((Mock*) ctx)->refreshes++; return 0; }
 static uint32_t s_waited = 0;
 static void s_wait(void* ctx, uint32_t ms) { (void) ctx; s_waited += ms; }
 static uint32_t s_clock = 0;
-static uint32_t s_msec(void* ctx) { (void) ctx; return s_clock += 2; }
+static uint32_t s_msec(void* ctx) { (void) ctx; return s_clock += 40; } /* ~ hours of repair in the test */
 
 static void test_strategies(void) {
     Mock* m = new_mock();
@@ -232,10 +235,41 @@ static void test_strategies(void) {
     CHECK(l.strat[CARTREF_STRAT_WIDE].fixed >= 1 && l.strat[CARTREF_STRAT_NORMAL].fixed == 0);
     for (int i = 0; i < CARTREF_STRATS; i++) CHECK(l.strat[i].attempts > 0 && l.strat[i].msec > 0);
     CHECK(s_waited == l.strat[CARTREF_STRAT_WAIT].attempts * CARTREF_WAIT_MS);
+    // with no clock the time unit is attempts; here a clock is set, so shares follow msec
     printf("strategies: attempts %llu/%llu/%llu/%llu, wide fixed %u, last sector %d\n",
         (unsigned long long) l.strat[0].attempts, (unsigned long long) l.strat[1].attempts,
         (unsigned long long) l.strat[2].attempts, (unsigned long long) l.strat[3].attempts,
         l.strat[CARTREF_STRAT_WIDE].fixed, find(&l, NSECT - 1)->state);
+    CartRef_ListFree(&l);
+    free_mock(m);
+}
+
+static void test_adaptive(void) {
+    // only one way of reading ever gets close: it should end up with most of the time
+    Mock* m = new_mock();
+    for (uint32_t k = 0; k < 6; k++) m->fault[3000 + 10 * (k / 2) + (k % 2)] = SINGLENEAR; /* 3 pairs */
+    CartRefIo io = io_for(m);
+    io.refresh_only = s_refresh_only; io.wait_ms = s_wait; io.msec = s_msec;
+    CartRefList l;
+    CartRef_ListInit(&l, 10);
+    for (uint32_t k = 0; k < 6; k++) CartRef_ListAdd(&l, 3000 + 10 * (k / 2) + (k % 2));
+    CartRefParams p;
+    CartRef_DefaultParams(&p);
+    p.retries_before_skip = 20000; p.autoskip = true; p.near_burst = 0;
+    CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
+    double sh[CARTREF_STRATS];
+    CartRef_StrategyShares(&io, &p, &l, sh);
+    uint64_t tot = 0;
+    for (int i = 0; i < CARTREF_STRATS; i++) tot += l.strat[i].msec;
+    CHECK(sh[CARTREF_STRAT_SINGLE] > 0.7);
+    CHECK(l.strat[CARTREF_STRAT_SINGLE].msec * 2 > tot);       // most of the time went to it
+    for (int i = 0; i < CARTREF_STRATS; i++) CHECK(sh[i] >= 0.029); // the others keep a little
+    printf("adaptive: single share %.2f, time %.0f%%\n", sh[CARTREF_STRAT_SINGLE],
+        100.0 * l.strat[CARTREF_STRAT_SINGLE].msec / tot);
+    // only normal allowed: the shares say so
+    p.strategies = 1u << CARTREF_STRAT_NORMAL;
+    CartRef_StrategyShares(&io, &p, &l, sh);
+    CHECK(sh[CARTREF_STRAT_NORMAL] == 1.0 && sh[CARTREF_STRAT_SINGLE] == 0);
     CartRef_ListFree(&l);
     free_mock(m);
 }
@@ -250,7 +284,7 @@ static void test_noise_not_stuck(void) {
     CartRef_ListAdd(&l, 10);
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0; p.experiment = false;
+    p.cold_every = 1; p.near_burst = 0; p.strategies = 1;
     p.stuck_limit = 5; p.retries_before_skip = 30; p.autoskip = true;
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     CHECK(l.s[0].state == CARTREF_SKIPPED);
@@ -268,7 +302,7 @@ static void test_read_errors(void) {
     CartRef_ListAdd(&l, 10);
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0; p.experiment = false;
+    p.cold_every = 1; p.near_burst = 0; p.strategies = 1;
     m->fail_next = 2; // transient: recovers
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
     CHECK(l.s[0].state == CARTREF_FIXED);
@@ -300,7 +334,7 @@ static void test_abort_and_resume(void) {
     CartRef_ListAdd(&l, 300);
     CartRefParams p;
     CartRef_DefaultParams(&p);
-    p.cold_every = 1; p.near_burst = 0; p.experiment = false;
+    p.cold_every = 1; p.near_burst = 0; p.strategies = 1;
     m->abort_after = 100;
     CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_ABORTED);
     CHECK(find(&l, 300)->state == CARTREF_FIXED);
@@ -372,6 +406,7 @@ int main(void) {
     test_runs_share_commands();
     test_near_miss_priority();
     test_strategies();
+    test_adaptive();
     test_noise_not_stuck();
     test_read_errors();
     test_abort_and_resume();
