@@ -847,7 +847,7 @@ u32 FixCartWithReference(const char* cart_path) {
         log_printf(&ctx, "%s", partinfo);
         FixerCfg_Load(&fixer_cfg);
         log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5 cold_every=%u near_burst=%u strategies=normal/wide4KB/wait%ums/refreshx2/single/stream (adaptive)\n",
-            fixer_cfg.stuck_limit, fixer_cfg.retries_before_skip, fixer_cfg.autoskip ? 1 : 0,
+            fixer_cfg.stuck_limit, fixer_cfg.retries_before_skip, (fixer_cfg.autoskip || autoretry) ? 1 : 0,
             (unsigned) CARTREF_COLD_EVERY, (unsigned) CARTREF_NEAR_BURST, (unsigned) CARTREF_WAIT_MS); /* = the CartRef_DefaultParams values */
         if (*FixerSim_Status()) log_printf(&ctx, "SIM BUILD: %s\n", FixerSim_Status());
         log_printf(&ctx, "auto retry: %s\n", autoretry ? "on" : "off");
@@ -924,7 +924,11 @@ u32 FixCartWithReference(const char* cart_path) {
         FixerCfg_Load(&fixer_cfg);  // share retry/stuck/autoskip with the classic fixer
         params.stuck_limit = fixer_cfg.stuck_limit;
         params.retries_before_skip = fixer_cfg.retries_before_skip;
-        params.autoskip = fixer_cfg.autoskip;
+        // Auto retry works by ending a round once every sector has had its share
+        // of attempts; without autoskip a round would never end (the red
+        // console's 11.7 h round 1 with autoskip=0 in the classic fixer's
+        // settings). So auto retry implies autoskip.
+        params.autoskip = fixer_cfg.autoskip || autoretry;
         learn_load(&list);   // start from what worked on earlier cartridges
         ctx.io = &io;
         ctx.params = &params;
