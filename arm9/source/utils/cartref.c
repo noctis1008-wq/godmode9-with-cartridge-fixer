@@ -1,6 +1,7 @@
 #include "cartref.h"
 
 #include <string.h>
+#include <math.h>
 #include <stdlib.h>
 
 // Consecutive failed cartridge reads before giving up (each one already waited
@@ -22,6 +23,9 @@ bool CartRef_ListInit(CartRefList* l, uint32_t capacity) {
     l->count = 0;
     l->overflow = false;
     memset(l->strat, 0, sizeof(l->strat));
+    memset(l->dec, 0, sizeof(l->dec));
+    l->dec_ready = false;
+    l->dec_clock = 0;
     l->capacity = capacity;
     l->s = (CartRefSector*) malloc((size_t) capacity * sizeof(CartRefSector));
     if (!l->s) l->capacity = 0;
@@ -140,12 +144,14 @@ CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint
  * least CARTREF_STRAT_PRIOR_MIN), so little data means "about average". The best strategies get most of the time (share grows with
  * the square of the yield), but every strategy keeps at least
  * CARTREF_STRAT_FLOOR of it, so a change (e.g. the easy sectors are done) is
- * noticed. The caller may preload the statistics learned on earlier cartridges
+ * noticed. The figures fade with a half-life of an hour of repair time, so the
+ * choice follows what works on the sectors that are left now. The caller may preload the statistics learned on earlier cartridges
  * (CartRefList.strat) as a starting point. */
 
 #define CARTREF_STRAT_FLOOR   0.03   /* minimum time share per strategy */
 #define CARTREF_STRAT_PRIOR_MIN 10.0 /* minimum weight of the "average" assumption (s, or k-attempts) */
 #define CARTREF_STREAM_READS  8u     /* plain reads after one refresh ("stream") */
+#define CARTREF_STRAT_HALFLIFE 3600.0 /* older results fade: half weight after an hour (s, or k-attempts) */
 
 static bool strat_usable(const CartRefIo* io, uint32_t s) {
     switch (s) {
@@ -161,6 +167,27 @@ static double strat_cost(const CartRefIo* io, const CartRefStratStats* s) {
     return io->msec ? (double) s->msec / 1000.0 : (double) s->attempts / 1000.0;
 }
 
+void CartRef_DecayStrategies(CartRefList* l, double cost_units) {
+    if (cost_units <= 0) return;
+    double k = pow(0.5, cost_units / CARTREF_STRAT_HALFLIFE);
+    for (uint32_t i = 0; i < CARTREF_STRATS; i++) {
+        l->dec[i].fixed *= k;
+        l->dec[i].near *= k;
+        l->dec[i].cost *= k;
+    }
+}
+
+/* the recent (decayed) figures start from whatever totals are there (e.g. learned ones) */
+static void strat_dec_init(const CartRefIo* io, CartRefList* l) {
+    if (l->dec_ready) return;
+    for (uint32_t i = 0; i < CARTREF_STRATS; i++) {
+        l->dec[i].fixed = l->strat[i].fixed;
+        l->dec[i].near = (double) l->strat[i].near_misses;
+        l->dec[i].cost = strat_cost(io, &l->strat[i]);
+    }
+    l->dec_ready = true;
+}
+
 void CartRef_StrategyShares(const CartRefIo* io, const CartRefParams* p, const CartRefList* l, double* share) {
     double F = 0, N = 0, T = 0;
     uint32_t usable = 0;
@@ -168,24 +195,34 @@ void CartRef_StrategyShares(const CartRefIo* io, const CartRefParams* p, const C
         share[i] = 0;
         if (!strat_usable(io, i) || !(p->strategies & (1u << i))) continue;
         usable++;
-        F += l->strat[i].fixed;
-        N += (double) l->strat[i].near_misses;
-        T += strat_cost(io, &l->strat[i]);
+        F += l->dec[i].fixed;
+        N += l->dec[i].near;
+        T += l->dec[i].cost;
     }
     if (!usable) return;
-    double K = (N + 1.0) / (F + 1.0);          /* near misses per fix, overall */
-    if (K < 20.0) K = 20.0;
-    double mean = (T > 0) ? (F + N / K) / T : 0; /* fix equivalents per second, overall */
+    /* Yield in fix equivalents: near misses count at this strategy's own rate of
+     * turning them into fixes, (F_i + 1) / (N_i + N/(F+1)), i.e. the overall rate
+     * until the strategy has fixes of its own. A strategy whose near misses rarely
+     * lead anywhere (e.g. "stream" on the red console: 489 near misses per 10k
+     * attempts but fewer fixes per hour than "wide") is valued by its fixes. */
+    double prior_near = (N + 1.0) / (F + 1.0);
+    double E[CARTREF_STRATS], Esum = 0;
+    for (uint32_t i = 0; i < CARTREF_STRATS; i++) {
+        E[i] = 0;
+        if (!strat_usable(io, i) || !(p->strategies & (1u << i))) continue;
+        const CartRefStratDecay* d = &l->dec[i];
+        E[i] = d->near * (d->fixed + 1.0) / (d->near + prior_near);
+        if (E[i] < d->fixed) E[i] = d->fixed; /* fixes always count in full */
+        Esum += E[i];
+    }
+    double mean = (T > 0) ? Esum / T : 0;
     double t0 = T / (16.0 * usable);
     if (t0 < CARTREF_STRAT_PRIOR_MIN) t0 = CARTREF_STRAT_PRIOR_MIN;
     double score[CARTREF_STRATS], sum = 0;
     for (uint32_t i = 0; i < CARTREF_STRATS; i++) {
         score[i] = 0;
         if (!strat_usable(io, i) || !(p->strategies & (1u << i))) continue;
-        const CartRefStratStats* s = &l->strat[i];
-        double e = s->fixed + (double) s->near_misses / K;
-        double t = strat_cost(io, s);
-        score[i] = (e + mean * t0) / (t + t0);
+        score[i] = (E[i] + mean * t0) / (l->dec[i].cost + t0);
         score[i] *= score[i];
         sum += score[i];
     }
@@ -197,19 +234,18 @@ void CartRef_StrategyShares(const CartRefIo* io, const CartRefParams* p, const C
     }
 }
 
-/* the strategy furthest behind its time share */
-static uint32_t strat_pick(const CartRefIo* io, const CartRefParams* p, const CartRefList* l, const double* share) {
+/* the strategy furthest behind its share of the recent time */
+static uint32_t strat_pick(const CartRefList* l, const double* share) {
     double total = 0;
     for (uint32_t i = 0; i < CARTREF_STRATS; i++)
-        if (share[i] > 0) total += strat_cost(io, &l->strat[i]);
+        if (share[i] > 0) total += l->dec[i].cost;
     uint32_t best = CARTREF_STRAT_NORMAL;
     double best_def = -1e300;
     for (uint32_t i = 0; i < CARTREF_STRATS; i++) {
         if (share[i] <= 0) continue;
-        double def = share[i] * total - strat_cost(io, &l->strat[i]);
+        double def = share[i] * total - l->dec[i].cost;
         if (def > best_def) { best_def = def; best = i; }
     }
-    (void) p;
     return best;
 }
 
@@ -314,7 +350,14 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
         /* round-relative attempt budget: the skip limit is reached by every sector at the same pass */
         bool at_limit = (uint64_t) st.pass * apv >= p->retries_before_skip;
         /* time shares of the read strategies, updated once per pass */
-        if (p->strategies & ~1u) CartRef_StrategyShares(io, p, list, share);
+        if (p->strategies & ~1u) {
+            strat_dec_init(io, list);
+            double now = 0;
+            for (uint32_t j = 0; j < CARTREF_STRATS; j++) now += strat_cost(io, &list->strat[j]);
+            if (list->dec_clock > 0) CartRef_DecayStrategies(list, now - list->dec_clock);
+            list->dec_clock = now;
+            CartRef_StrategyShares(io, p, list, share);
+        }
 
         uint32_t i = 0;
         while (i < list->count) {
@@ -350,7 +393,7 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
 
                 uint32_t sidx = CARTREF_STRAT_NORMAL;
                 if (sticky >= 0) sidx = (uint32_t) sticky;
-                else if (p->strategies & ~1u) sidx = strat_pick(io, p, list, share);
+                else if (p->strategies & ~1u) sidx = strat_pick(list, share);
                 uint32_t t0 = io->msec ? io->msec(io->ctx) : 0;
                 const uint8_t* data;
                 int rr = strat_attempt(io, &sidx, run, n, cbuf, wbuf, &data, m, cover);
@@ -362,6 +405,7 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                 read_fails = 0;
                 st.total_attempts++;
                 CartRefStratStats* ss = &list->strat[sidx];
+                CartRefStratDecay* sd = &list->dec[sidx];
                 ss->attempts++;
 
                 /* matches get confirmed with plain reads (no refresh) */
@@ -396,12 +440,14 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                     if (cand[k] && !readerr) {
                         s->state = CARTREF_FIXED;
                         ss->fixed++;
+                        sd->fixed += 1.0;
                         continue;
                     }
                     if (m[k] && !readerr) { /* matched once, then the plain reads disagreed */
                         s->near_miss++;
                         st.near_misses++;
                         ss->near_misses++;
+                        sd->near += 1.0;
                         /* close to recovering: keep at it for a while, the same way */
                         if (p->near_burst) {
                             uint32_t want = a + 1 + p->near_burst;
@@ -421,7 +467,13 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                     if (p->stuck_limit && (s->stuck >= p->stuck_limit))
                         s->state = CARTREF_UNFIXABLE;
                 }
-                if (io->msec) ss->msec += (uint32_t) (io->msec(io->ctx) - t0);
+                if (io->msec) {
+                    uint32_t dt = (uint32_t) (io->msec(io->ctx) - t0);
+                    ss->msec += dt;
+                    sd->cost += dt / 1000.0;
+                } else {
+                    sd->cost += 1.0 / 1000.0;
+                }
             }
             /* retry limit (counted in passes): skip what is left of the run */
             if (at_limit) {

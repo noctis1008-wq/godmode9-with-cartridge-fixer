@@ -3,6 +3,7 @@
 #include "cartref.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -274,6 +275,35 @@ static void test_adaptive(void) {
     free_mock(m);
 }
 
+static void test_red_console_shares(void) {
+    // figures from the red console's night: stream had by far the most near
+    // misses but fewer fixes per hour than wide/normal; the fixes must decide
+    static const double F[CARTREF_STRATS] = { 22, 27, 4, 10, 3, 31 };
+    static const double N[CARTREF_STRATS] = { 13458, 12325, 2488, 6940, 2914, 87775 };
+    static const double T[CARTREF_STRATS] = { 6932, 7458, 2784, 4481, 2648, 14030 };
+    Mock* m = new_mock();
+    CartRefIo io = io_for(m);
+    io.refresh_only = s_refresh_only; io.wait_ms = s_wait; io.msec = s_msec;
+    CartRefList l;
+    CartRef_ListInit(&l, 4);
+    for (int i = 0; i < CARTREF_STRATS; i++) { l.dec[i].fixed = F[i]; l.dec[i].near = N[i]; l.dec[i].cost = T[i]; }
+    l.dec_ready = true;
+    CartRefParams p;
+    CartRef_DefaultParams(&p);
+    double sh[CARTREF_STRATS];
+    CartRef_StrategyShares(&io, &p, &l, sh);
+    printf("red shares: normal %.2f wide %.2f wait %.2f x2 %.2f single %.2f stream %.2f\n",
+        sh[0], sh[1], sh[2], sh[3], sh[4], sh[5]);
+    CHECK(sh[CARTREF_STRAT_WIDE] > sh[CARTREF_STRAT_STREAM]);
+    CHECK(sh[CARTREF_STRAT_NORMAL] > sh[CARTREF_STRAT_STREAM]);
+    CHECK(sh[CARTREF_STRAT_WIDE] > sh[CARTREF_STRAT_SINGLE]);
+    // an hour of repair halves the old figures
+    CartRef_DecayStrategies(&l, 3600.0);
+    CHECK(fabs(l.dec[1].fixed - 13.5) < 1e-9 && fabs(l.dec[5].cost - 7015) < 1e-6);
+    CartRef_ListFree(&l);
+    free_mock(m);
+}
+
 static void test_noise_not_stuck(void) {
     // Data that keeps changing is never "stuck": only the retry limit ends it.
     Mock* m = new_mock();
@@ -407,6 +437,7 @@ int main(void) {
     test_near_miss_priority();
     test_strategies();
     test_adaptive();
+    test_red_console_shares();
     test_noise_not_stuck();
     test_read_errors();
     test_abort_and_resume();

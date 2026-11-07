@@ -45,6 +45,10 @@ typedef struct {
     uint32_t reserved;
 } CartRefStratStats;
 
+typedef struct {         // the same, fading with time (what the choice is based on)
+    double fixed, near, cost;
+} CartRefStratDecay;
+
 typedef enum {
     CARTREF_PENDING = 0,
     CARTREF_FIXED,
@@ -68,6 +72,9 @@ typedef struct {
     uint32_t capacity;
     bool overflow;        // more bad sectors existed than fit in the list
     CartRefStratStats strat[CARTREF_STRATS]; // accumulated over every repair round
+    CartRefStratDecay dec[CARTREF_STRATS];   // recent results (half-life one hour)
+    bool dec_ready;
+    double dec_clock;
 } CartRefList;
 
 typedef struct {
@@ -163,8 +170,11 @@ CartRefResult CartRef_Scan(const CartRefIo* io, const CartRefRange* ranges, uint
 CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRefList* list);
 
 // Current time share (0..1) of every read strategy, from the statistics in
-// list->strat (unusable or disabled strategies get 0).
+// list->dec (unusable or disabled strategies get 0).
 void CartRef_StrategyShares(const CartRefIo* io, const CartRefParams* p, const CartRefList* l, double* share);
+
+// Let the recent figures fade by `cost_units` (seconds, or k-attempts without a clock).
+void CartRef_DecayStrategies(CartRefList* l, double cost_units);
 
 // Resume state (serialised list of unresolved sectors).
 typedef struct {
