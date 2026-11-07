@@ -541,6 +541,9 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     const int lh = 12;
     u64 sec = timer_sec(ctx->run_timer);
 
+    // version in the top right corner (the line "Refresh count:" holds the left side)
+    DrawString(MAIN_SCREEN, VERSION, SCREEN_WIDTH_MAIN - (int) strlen(VERSION) * FONT_WIDTH_EXT - 4, 0,
+        COLOR_GREY, COLOR_STD_BG);
     DrawString(MAIN_SCREEN, "Fix with reference image", x, y, COLOR_STD_FONT, COLOR_STD_BG); y += 2 * lh;
     snprintf(line, sizeof(line), "Round %-3lu Pass %-6lu Time %02lu:%02lu:%02lu   ", (unsigned long) ctx->round, (unsigned long) st->pass,
         (unsigned long) (sec / 3600), (unsigned long) ((sec / 60) % 60), (unsigned long) (sec % 60));

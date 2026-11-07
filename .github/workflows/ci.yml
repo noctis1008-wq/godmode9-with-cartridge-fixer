@@ -33,7 +33,9 @@ jobs:
           python3 -m pip install --break-system-packages cryptography git+https://github.com/TuxSH/firmtool.git
 
       - name: Build Project
-        run: make release -j$(nproc)
+        # VERSION shows on the repair screen and in the logs: "build<N>-<commit>",
+        # N being the release number (reffix-N) this build is published as
+        run: make release -j$(nproc) VERSION="build${{ github.run_number }}-${GITHUB_SHA::7}"
 
       - name: Prepare build artifact
         working-directory: release
