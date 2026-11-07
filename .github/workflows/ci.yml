@@ -35,7 +35,7 @@ jobs:
       - name: Build Project
         # VERSION shows on the repair screen and in the logs: "build<N>-<commit>",
         # N being the release number (reffix-N) this build is published as
-        run: make release -j$(nproc) VERSION="build${{ github.run_number }}-${GITHUB_SHA::7}"
+        run: make release -j$(nproc) VERSION="build${{ github.run_number }}-$(echo $GITHUB_SHA | cut -c1-7)"
 
       - name: Prepare build artifact
         working-directory: release
