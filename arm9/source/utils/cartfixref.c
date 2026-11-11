@@ -98,7 +98,8 @@ typedef struct {
     u64 recheck_timer;        // since fixed sectors were last read again
     u64 strat_log_timer;      // since the strategy figures were last logged
     u32 fixed_at_round_start; // to count the sectors fixed in the current round
-    u32 round_fixed[REF_HISTORY]; // sectors fixed in the last finished rounds (ring buffer)
+    s32 round_fixed[REF_HISTORY]; // net sectors fixed in the last finished rounds (ring buffer; negative
+                                  // when the hourly recheck put back more than the round fixed)
     u32 rounds_done;
     u64 status_timer;
     u64 run_timer;
@@ -619,8 +620,8 @@ static void io_status(void* vctx, const CartRefStatus* st) {
             (unsigned long) ((eta / 60) % 60), (unsigned long) (eta % 60));
     } else snprintf(line, sizeof(line), "Est. left  estimating...          ");
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
-    snprintf(line, sizeof(line), "Fixed      %-6lu (this round %lu)        ", (unsigned long) st->fixed,
-        (unsigned long) (st->fixed - ctx->fixed_at_round_start));
+    snprintf(line, sizeof(line), "Fixed      %-6lu (this round %ld)        ", (unsigned long) st->fixed,
+        (long) ((s32) st->fixed - (s32) ctx->fixed_at_round_start));
     DrawString(MAIN_SCREEN, line, x, y, COLOR_GREEN, COLOR_STD_BG); y += lh;
     snprintf(line, sizeof(line), "Unfixable  %-10lu              ", (unsigned long) st->unfixable);
     DrawString(MAIN_SCREEN, line, x, y, COLOR_RED, COLOR_STD_BG); y += lh;
@@ -645,14 +646,15 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     DrawString(MAIN_SCREEN, "Hold Y: skip sector at retry limit", x, y, COLOR_STD_FONT, COLOR_STD_BG);
 
     // bottom two rows: sectors fixed per round, newest 10 (the running round last, marked *)
-    u32 vals[REF_HISTORY], rnds[REF_HISTORY];
+    s32 vals[REF_HISTORY];
+    u32 rnds[REF_HISTORY];
     u32 n = 0;
     u32 first = (ctx->rounds_done >= REF_HISTORY) ? ctx->rounds_done - (REF_HISTORY - 1) : 0;
     for (u32 r = first; r < ctx->rounds_done; r++, n++) {
         vals[n] = ctx->round_fixed[r % REF_HISTORY];
         rnds[n] = r + 1;
     }
-    vals[n] = st->fixed - ctx->fixed_at_round_start; // running round
+    vals[n] = (s32) st->fixed - (s32) ctx->fixed_at_round_start; // running round
     rnds[n] = ctx->round;
     n++;
     // wrap the newest entries into two rows that fit the screen; drop the oldest if needed
@@ -660,7 +662,7 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     char tok[REF_HISTORY][16];
     u32 tlen[REF_HISTORY];
     for (u32 i = 0; i < n; i++)
-        tlen[i] = snprintf(tok[i], sizeof(tok[i]), "R%lu:%lu%s", (unsigned long) rnds[i], (unsigned long) vals[i],
+        tlen[i] = snprintf(tok[i], sizeof(tok[i]), "R%lu:%ld%s", (unsigned long) rnds[i], (long) vals[i],
             (i == n - 1) ? "*" : "");
     u32 start = 0;
     for (; start < n; start++) { // first start index whose tokens fit in two rows
@@ -1115,7 +1117,7 @@ u32 FixCartWithReference(const char* cart_path) {
             ClearScreenF(true, false, COLOR_STD_BG);
 
             CartRef_Count(&list, &rs);
-            ctx.round_fixed[ctx.rounds_done % REF_HISTORY] = rs.fixed - ctx.fixed_at_round_start;
+            ctx.round_fixed[ctx.rounds_done % REF_HISTORY] = (s32) rs.fixed - (s32) ctx.fixed_at_round_start;
             ctx.rounds_done++;
             log_time(&ctx);
             log_printf(&ctx, "round %lu end: result %d, fixed %lu, unfixable %lu, skipped %lu, remaining %lu (%llu s)\n",
