@@ -191,7 +191,7 @@ Why it is faster: the classic fixer can only check data against the game's own h
 - The two bottom rows show how many sectors each round fixed (newest 10; `*` = the running round).
 - **B** pauses. Progress is saved to `SD:/gm9/out/cartref_<titleid>.dat` after every pass; run the option again to resume.
 - A detailed log (settings, scan speed, where the bad sectors are, a summary per pass, the result per sector) is written to `SD:/luma/payloads/log/` and updated after every pass.
-- Retry limit, stuck limit and autoskip are shared with the classic fixer settings.
+- Settings are fixed at the values the repair logs support (stuck limit 50, 2500 attempts per sector per round, autoskip on, rounds of at least 5 minutes); they no longer come from the classic fixer's `fixer.cfg`.
 - Run **Verify** afterwards. Partitions marked as different still need the classic **Fix cartridge corruption**.
 
 ## Options

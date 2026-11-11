@@ -36,6 +36,10 @@
 #define REF_SHUTDOWN_SEC    30                   // power off this long after everything is fixed
 #define REF_HISTORY         10                   // rounds shown in the "fixed per round" rows
 #define REF_CFG_PATH        OUTPUT_PATH "/reffix.cfg"
+// repair settings (no longer taken from the classic fixer's fixer.cfg)
+#define REF_STUCK_LIMIT     50     // identical wrong reads in a row before "unfixable" (for this round)
+#define REF_RETRIES         2500   // attempts per sector per round (rounds also last >= 5 min)
+#define REF_AUTOSKIP        true   // skip at the limit, retry in the next round
 
 static char ref_ident[64]; // "Cart <name|id> @ <console>" for the repair screen
 #define REF_HASH_SECTORS    0x800u               // sectors hashed per read when creating a .crh
@@ -997,9 +1001,8 @@ u32 FixCartWithReference(const char* cart_path) {
         log_printf(&ctx, "ref:  %s  (%s, image size %llu)\n", ref_path, ref->is_hash ? "hash file" : "full image",
             (unsigned long long) ref_size);
         log_printf(&ctx, "%s", partinfo);
-        FixerCfg_Load(&fixer_cfg);
         log_printf(&ctx, "settings: stuck_limit=%lu retries_before_skip=%lu autoskip=%d attempts_per_visit=4 confirm_reads=5 cold_every=%u near_burst=%u strategies=normal/wide4KB/wait%ums/refreshx2/single/stream (adaptive)\n",
-            fixer_cfg.stuck_limit, fixer_cfg.retries_before_skip, (fixer_cfg.autoskip || autoretry) ? 1 : 0,
+            (unsigned long) REF_STUCK_LIMIT, (unsigned long) REF_RETRIES, (REF_AUTOSKIP || autoretry) ? 1 : 0,
             (unsigned) CARTREF_COLD_EVERY, (unsigned) CARTREF_NEAR_BURST, (unsigned) CARTREF_WAIT_MS); /* = the CartRef_DefaultParams values */
         if (*FixerSim_Status()) log_printf(&ctx, "SIM BUILD: %s\n", FixerSim_Status());
         log_printf(&ctx, "auto retry: %s\n", autoretry ? "on" : "off");
@@ -1073,14 +1076,13 @@ u32 FixCartWithReference(const char* cart_path) {
     if (res == CARTREF_OK) {
         static CartRefParams params; // static: the log summary after this block still reads it
         CartRef_DefaultParams(&params);
-        FixerCfg_Load(&fixer_cfg);  // share retry/stuck/autoskip with the classic fixer
-        params.stuck_limit = fixer_cfg.stuck_limit;
-        params.retries_before_skip = fixer_cfg.retries_before_skip;
-        // Auto retry works by ending a round once every sector has had its share
-        // of attempts; without autoskip a round would never end (the red
-        // console's 11.7 h round 1 with autoskip=0 in the classic fixer's
-        // settings). So auto retry implies autoskip.
-        params.autoskip = fixer_cfg.autoskip || autoretry;
+        // Own settings, independent of the classic fixer's gm9/out/fixer.cfg (whose
+        // values differed between the two consoles: 500/off from the defaults
+        // there, 2500/on where it had been saved). These are the values the logs
+        // support; auto retry needs autoskip, or round 1 never ends.
+        params.stuck_limit = REF_STUCK_LIMIT;
+        params.retries_before_skip = REF_RETRIES;
+        params.autoskip = REF_AUTOSKIP || autoretry;
         learn_load(&list);   // start from what worked on earlier cartridges
         params.low_every = 16;
         params.critical_boost = 4;
