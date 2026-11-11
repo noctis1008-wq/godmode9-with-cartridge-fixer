@@ -82,6 +82,18 @@ typedef struct _SysInfo {
 
 
 // Read hardware information.
+void GetSysInfo_Hardware(SysInfo* info, char nand_drive);
+void GetSysInfo_SecureInfo(SysInfo* info, char nand_drive);
+
+void GetConsoleIdentity(char* serial, size_t serial_size, char* model, size_t model_size) {
+    static SysInfo info; // big: keep it off the stack
+    memset(&info, 0, sizeof(info));
+    GetSysInfo_Hardware(&info, '1');
+    GetSysInfo_SecureInfo(&info, '1');
+    snprintf(serial, serial_size, "%s", info.serial);
+    snprintf(model, model_size, "%s", info.model);
+}
+
 void GetSysInfo_Hardware(SysInfo* info, char nand_drive) {
     (void) nand_drive;
 

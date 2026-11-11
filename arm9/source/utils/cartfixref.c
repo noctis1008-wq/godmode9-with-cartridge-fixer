@@ -17,6 +17,8 @@
 #include "fsinit.h"
 #include "power.h"
 #include "rtc.h"
+#include "sysinfo.h"
+#include "swkbd.h"
 
 #include <stdarg.h>
 
@@ -34,6 +36,8 @@
 #define REF_SHUTDOWN_SEC    30                   // power off this long after everything is fixed
 #define REF_HISTORY         10                   // rounds shown in the "fixed per round" rows
 #define REF_CFG_PATH        OUTPUT_PATH "/reffix.cfg"
+
+static char ref_ident[64]; // "Cart <name|id> @ <console>" for the repair screen
 #define REF_HASH_SECTORS    0x800u               // sectors hashed per read when creating a .crh
 
 extern bool force_refresh;                       // command_ctr.c: refresh before every read
@@ -544,7 +548,9 @@ static void io_status(void* vctx, const CartRefStatus* st) {
     // version in the top right corner (the line "Refresh count:" holds the left side)
     DrawString(MAIN_SCREEN, VERSION, SCREEN_WIDTH_MAIN - (int) strlen(VERSION) * FONT_WIDTH_EXT - 4, 0,
         COLOR_GREY, COLOR_STD_BG);
-    DrawString(MAIN_SCREEN, "Fix with reference image", x, y, COLOR_STD_FONT, COLOR_STD_BG); y += 2 * lh;
+    DrawString(MAIN_SCREEN, "Fix with reference image", x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
+    if (*ref_ident) DrawString(MAIN_SCREEN, ref_ident, x, y, COLOR_GREY, COLOR_STD_BG);
+    y += lh;
     snprintf(line, sizeof(line), "Round %-3lu Pass %-6lu Time %02lu:%02lu:%02lu   ", (unsigned long) ctx->round, (unsigned long) st->pass,
         (unsigned long) (sec / 3600), (unsigned long) ((sec / 60) % 60), (unsigned long) (sec % 60));
     DrawString(MAIN_SCREEN, line, x, y, COLOR_STD_FONT, COLOR_STD_BG); y += lh;
@@ -641,8 +647,85 @@ static u32 count_diff(const u8* a, const u8* b, u32 size) {
     return n;
 }
 
-static void state_path(char* out, size_t size, u64 title_id) {
-    snprintf(out, size, "%s/cartref_%016llX.dat", OUTPUT_PATH, (unsigned long long) title_id);
+static void state_path(char* out, size_t size, u64 title_id, const char* cart_id) {
+    if (cart_id && *cart_id)
+        snprintf(out, size, "%s/cartref_%016llX_%s.dat", OUTPUT_PATH, (unsigned long long) title_id, cart_id);
+    else snprintf(out, size, "%s/cartref_%016llX.dat", OUTPUT_PATH, (unsigned long long) title_id);
+}
+
+// ---- which cartridge, which console ----
+//
+// Several cartridges of the same game get repaired side by side, on more than
+// one console. A cartridge is told apart by its unique ID (the private header
+// GodMode9 shows as C:/<name>-priv.bin; every retail card has its own), shown
+// as 8 hex digits (start of its SHA-256). A console by the serial number on its
+// label. Both can be given a short name, kept in REF_NAMES_FILE on this SD card.
+
+#define REF_NAMES_FILE OUTPUT_PATH "/reffix_names.txt"
+#define REF_NAME_LEN   24
+
+static void ref_ident_set(const char* cart_id, const char* cart_name, const char* con_name) {
+    snprintf(ref_ident, sizeof(ref_ident), "Cart %s @ %s", *cart_name ? cart_name : (*cart_id ? cart_id : "?"),
+        *con_name ? con_name : "this console");
+}
+
+static bool cart_unique_id(const char* cart_path, char* out, size_t size) {
+    char ppath[256];
+    snprintf(ppath, sizeof(ppath), "%s", cart_path);
+    char* dot = strrchr(ppath, '.');
+    if (!dot) return false;
+    snprintf(dot, sizeof(ppath) - (dot - ppath), "-priv.bin");
+    u8 priv[0x40];
+    if (FileGetData(ppath, priv, sizeof(priv), 0) != sizeof(priv)) return false;
+    bool blank = true;
+    for (u32 i = 0; i < sizeof(priv); i++) blank &= (priv[i] == 0x00) || (priv[i] == 0xFF);
+    if (blank) return false;
+    u8 sha[32];
+    sha_quick(sha, priv, sizeof(priv), SHA256_MODE);
+    snprintf(out, size, "%02X%02X%02X%02X", sha[0], sha[1], sha[2], sha[3]);
+    return true;
+}
+
+// name for "<kind> <key>" from the names file ("" if none)
+static void names_get(const char* kind, const char* key, char* name, size_t size) {
+    *name = '\0';
+    static char buf[4096];
+    size_t n = FileGetData(REF_NAMES_FILE, buf, sizeof(buf) - 1, 0);
+    buf[n] = '\0';
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "%s %s ", kind, key);
+    size_t pl = strlen(prefix);
+    for (char* line = buf; line && *line;) {
+        char* next = strchr(line, '\n');
+        if (next) *next++ = '\0';
+        if (strncmp(line, prefix, pl) == 0) {
+            snprintf(name, size, "%s", line + pl);
+            char* cr = strchr(name, '\r');
+            if (cr) *cr = '\0';
+        }
+        line = next;
+    }
+}
+
+static void names_add(const char* kind, const char* key, const char* name) {
+    char line[128];
+    snprintf(line, sizeof(line), "%s %s %s\n", kind, key, name);
+    fvx_rmkdir(OUTPUT_PATH);
+    FileSetData(REF_NAMES_FILE, line, strlen(line), fvx_qsize(REF_NAMES_FILE), false);
+}
+
+// the stored name, or ask for one the first time (empty answer: no name, ask again next time)
+static void name_for(const char* kind, const char* key, const char* what, char* name, size_t size) {
+    names_get(kind, key, name, size);
+    if (*name || !key || !*key || (strcmp(key, "<unknown>") == 0)) return;
+    char in[REF_NAME_LEN + 1] = { 0 };
+    if (ShowKeyboardOrPrompt(in, sizeof(in),
+            "Name this %s for the logs\n(e.g. %s). It is asked only once.\n \n%s", what,
+            (strcmp(kind, "cart") == 0) ? "ORAS-A" : "red", key) && *in) {
+        for (char* c = in; *c; c++) if ((*c < 0x20) || (*c > 0x7E)) *c = '_';
+        names_add(kind, key, in);
+        snprintf(name, size, "%s", in);
+    }
 }
 
 u32 FixCartWithReference(const char* cart_path) {
@@ -756,9 +839,25 @@ u32 FixCartWithReference(const char* cart_path) {
         goto done;
     }
 
-    // resume?
-    char spath[64];
-    state_path(spath, sizeof(spath), ncsd_cart.mediaId);
+    // which cartridge, which console
+    static char cart_id[16], cart_name[REF_NAME_LEN + 1], con_serial[20], con_model[32], con_name[REF_NAME_LEN + 1];
+    if (!cart_unique_id(cart_path, cart_id, sizeof(cart_id))) *cart_id = '\0';
+    GetConsoleIdentity(con_serial, sizeof(con_serial), con_model, sizeof(con_model));
+    name_for("console", con_serial, "console", con_name, sizeof(con_name));
+    name_for("cart", cart_id, "cartridge", cart_name, sizeof(cart_name));
+    ref_ident_set(cart_id, cart_name, con_name);
+
+    // resume? (progress is kept per cartridge)
+    char spath[96];
+    state_path(spath, sizeof(spath), ncsd_cart.mediaId, cart_id);
+    if (*cart_id && !fvx_qsize(spath)) {
+        // progress saved before cartridges were told apart: it may belong to another card
+        char old[96];
+        state_path(old, sizeof(old), ncsd_cart.mediaId, NULL);
+        if (fvx_qsize(old) && ShowPrompt(true, "Saved progress from an older version\nwas found for this game, without a\ncartridge ID.\n \nIs it from THIS cartridge (%s)?\n(No = leave it, start fresh)",
+                *cart_name ? cart_name : cart_id))
+            fvx_rename(old, spath);
+    }
     CartRefResumeHeader rhdr;
     memset(&rhdr, 0, sizeof(rhdr));
     rhdr.title_id = ncsd_cart.mediaId;
@@ -830,18 +929,22 @@ u32 FixCartWithReference(const char* cart_path) {
             goto done;
         }
     }
-    // log: SD:/luma/payloads/log/reffix_<titleid>_<date>.log
+    // log: SD:/luma/payloads/log/reffix_<titleid>_<cart id>_<date>.log
     ctx.log = (char*) malloc(REF_LOG_EVENTS_SIZE);
     if (ctx.log) {
         DsTime t;
         get_dstime(&t);
-        snprintf(ctx.log_path, sizeof(ctx.log_path), "%s/reffix_%016llX_%02lX%02lX%02lX_%02lX%02lX%02lX.log", REF_LOG_DIR,
-            (unsigned long long) ncsd_cart.mediaId, (u32) t.bcd_Y, (u32) t.bcd_M, (u32) t.bcd_D,
+        snprintf(ctx.log_path, sizeof(ctx.log_path), "%s/reffix_%016llX_%s%s%02lX%02lX%02lX_%02lX%02lX%02lX.log", REF_LOG_DIR,
+            (unsigned long long) ncsd_cart.mediaId, cart_id, *cart_id ? "_" : "", (u32) t.bcd_Y, (u32) t.bcd_M, (u32) t.bcd_D,
             (u32) t.bcd_h, (u32) t.bcd_m, (u32) t.bcd_s);
         log_time(&ctx);
         log_printf(&ctx, "Fix with reference image - GodMode9 %s (%s)\n", VERSION, DBUILTL);
         log_printf(&ctx, "cart: %s  title %016llX  size %llu\n", cart_path, (unsigned long long) ncsd_cart.mediaId,
             (unsigned long long) cart_size);
+        log_printf(&ctx, "cartridge: id %s%s%s%s\n", *cart_id ? cart_id : "unknown (private header not readable)",
+            *cart_name ? " (" : "", cart_name, *cart_name ? ")" : "");
+        log_printf(&ctx, "console:   serial %s, %s%s%s%s\n", con_serial, con_model,
+            *con_name ? " (" : "", con_name, *con_name ? ")" : "");
         log_printf(&ctx, "ref:  %s  (%s, image size %llu)\n", ref_path, ref->is_hash ? "hash file" : "full image",
             (unsigned long long) ref_size);
         log_printf(&ctx, "%s", partinfo);
