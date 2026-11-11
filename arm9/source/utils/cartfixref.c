@@ -91,6 +91,8 @@ typedef struct {
     u32 last_resolved;        // fixed+unfixable+skipped at the last logged pass
     u32 quiet_passes;         // passes since the last logged one
     u64 save_timer;           // since the last progress/log save
+    u64 recheck_timer;        // since fixed sectors were last read again
+    u64 strat_log_timer;      // since the strategy figures were last logged
     u32 fixed_at_round_start; // to count the sectors fixed in the current round
     u32 round_fixed[REF_HISTORY]; // sectors fixed in the last finished rounds (ring buffer)
     u32 rounds_done;
@@ -124,6 +126,31 @@ static void log_time(RefCtx* ctx) {
 // Which part of the NCCH a sector belongs to (for the log).
 enum { RG_HEADER = 0, RG_EXHEADER, RG_LOGO, RG_PLAIN, RG_EXEFS, RG_ROMFS, RG_OTHER, RG_COUNT };
 static const char* rg_names[RG_COUNT] = { "header", "exheader", "logo", "plain", "exefs", "romfs", "other" };
+
+static u32 sector_region(const RefCtx* ctx, u32 sector, u32* part_out);
+
+// Where a sector lies decides how much it matters: the game (content 0) does
+// not start without its headers, exheader and ExeFS (a bad ExeFS sector shows as
+// a "loader" crash with D9004587); the other partitions (manual, download play
+// child, update data) are not needed to play.
+static u32 set_priorities(const RefCtx* ctx, CartRefList* l, u32* n_crit, u32* n_low) {
+    u32 c = 0, lo = 0;
+    for (u32 i = 0; i < l->count; i++) {
+        u32 part = 0xFF;
+        u32 rg = sector_region(ctx, l->s[i].sector, &part);
+        u8 prio = CARTREF_PRIO_NORMAL;
+        if (part != 0) prio = CARTREF_PRIO_LOW;
+        else if ((rg == RG_HEADER) || (rg == RG_EXHEADER) || (rg == RG_EXEFS)) prio = CARTREF_PRIO_CRITICAL;
+        l->s[i].prio = prio;
+        if (l->s[i].state == CARTREF_PENDING) {
+            c += (prio == CARTREF_PRIO_CRITICAL);
+            lo += (prio == CARTREF_PRIO_LOW);
+        }
+    }
+    if (n_crit) *n_crit = c;
+    if (n_low) *n_low = lo;
+    return c;
+}
 
 static u32 sector_region(const RefCtx* ctx, u32 sector, u32* part_out) {
     for (u32 p = 0; p < ctx->n_parts; p++) {
@@ -250,6 +277,22 @@ static bool save_state(RefCtx* ctx) {
     return ok;
 }
 
+#define REF_RECHECK_SEC  3600
+#define REF_STRATLOG_SEC 3600
+
+static u32 recheck_fixed(RefCtx* ctx, const char* why) {
+    u64 t0 = timer_start();
+    u32 checked = 0;
+    u32 relapsed = CartRef_Recheck(ctx->io, ctx->list, &checked);
+    ctx->recheck_timer = timer_start();
+    if (checked || relapsed) {
+        log_time(ctx);
+        log_printf(ctx, "recheck (%s): %lu of %lu fixed sectors read wrong again, back in the queue (%llu s)\n",
+            why, relapsed, checked, (unsigned long long) timer_sec(t0));
+    }
+    return relapsed;
+}
+
 static void io_end_pass(void* vctx, const CartRefStatus* st) {
     RefCtx* ctx = (RefCtx*) vctx;
     // A pass takes about a second, so logging and saving every one of them
@@ -268,6 +311,12 @@ static void io_end_pass(void* vctx, const CartRefStatus* st) {
         ctx->quiet_passes         = 0;
     }
     ctx->pass_timer = timer_start();
+    // Sectors fixed earlier can go bad again (seen when a card moved to the other
+    // console): read them again every hour and put relapsed ones back in the queue.
+    if (ctx->io && ctx->list && (timer_sec(ctx->recheck_timer) >= REF_RECHECK_SEC)) {
+        recheck_fixed(ctx, "hourly");
+        changed = true;
+    }
     if (changed || (timer_msec(ctx->save_timer) >= REF_SAVE_MS)) {
         ctx->last_resolved = resolved;
         ctx->save_timer    = timer_start();
@@ -1033,6 +1082,16 @@ u32 FixCartWithReference(const char* cart_path) {
         // settings). So auto retry implies autoskip.
         params.autoskip = fixer_cfg.autoskip || autoretry;
         learn_load(&list);   // start from what worked on earlier cartridges
+        params.low_every = 16;
+        params.critical_boost = 4;
+        params.min_round_ms = 5 * 60 * 1000;
+        {
+            u32 n_crit = 0, n_low = 0;
+            set_priorities(&ctx, &list, &n_crit, &n_low);
+            log_printf(&ctx, "priorities: %lu critical (header/exheader/ExeFS, 4x attempts), %lu low (other partitions, every 16th pass); fixed sectors reread hourly; rounds last at least 5 min\n",
+                n_crit, n_low);
+        }
+        ctx.recheck_timer = ctx.strat_log_timer = timer_start();
         ctx.io = &io;
         ctx.params = &params;
 
@@ -1060,8 +1119,20 @@ u32 FixCartWithReference(const char* cart_path) {
             log_printf(&ctx, "round %lu end: result %d, fixed %lu, unfixable %lu, skipped %lu, remaining %lu (%llu s)\n",
                 ctx.round, (int) res, rs.fixed, rs.unfixable, rs.skipped, rs.pending,
                 (unsigned long long) timer_sec(ctx.run_timer));
-            log_strats(&ctx);
-            if ((res != CARTREF_OK) || !autoretry || !(rs.unfixable + rs.skipped)) break;
+            if (timer_sec(ctx.strat_log_timer) >= REF_STRATLOG_SEC) {
+                log_strats(&ctx);
+                ctx.strat_log_timer = timer_start();
+            }
+            if ((res == CARTREF_OK) && !rs.pending && !(rs.unfixable + rs.skipped)) {
+                // everything fixed: make sure it still reads right before calling it done
+                if (recheck_fixed(&ctx, "before finishing")) {
+                    save_state(&ctx);
+                    log_save(&ctx);
+                    continue;
+                }
+                break;
+            }
+            if ((res != CARTREF_OK) || !autoretry) break;
 
             // next round straight away: a 10 s countdown every ~3 minutes only
             // cost time, and B still pauses the repair at any moment

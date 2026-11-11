@@ -24,6 +24,13 @@
 #define CARTREF_WAIT_MS     5u       // "wait" strategy: pause between refresh and read
 #define CARTREF_WIDE        8u       // "wide" strategy: read the aligned 4 KB block around the run
 
+// How much a sector matters, set by the caller from where it lies.
+enum {
+    CARTREF_PRIO_CRITICAL = 0, // headers, exheader, ExeFS: the game does not start without them
+    CARTREF_PRIO_NORMAL,       // RomFS and anything else
+    CARTREF_PRIO_LOW           // partitions not needed to play (manual, update data)
+};
+
 // Read strategies. Each attempt uses one of them; their time shares adapt to
 // how well each works on the cartridge (see CartRef_StrategyShares).
 enum {
@@ -63,6 +70,7 @@ typedef struct {
     uint16_t stuck;       // consecutive identical mismatching reads
     uint8_t  confirm;     // consecutive matching confirmation reads
     uint8_t  state;       // CartRefState
+    uint8_t  prio;        // CARTREF_PRIO_* (set by the caller; not saved)
     uint32_t near_miss;   // refreshed reads that matched but failed confirmation
 } CartRefSector;
 
@@ -91,6 +99,9 @@ typedef struct {
     uint32_t cold_every;          // visit runs without near misses every Nth pass (0/1: every pass)
     uint32_t near_burst;          // extra attempts after a near miss (0: none)
     uint32_t strategies;          // bit mask of CARTREF_STRAT_* to use (bit 0 alone: normal only)
+    uint32_t low_every;           // visit CARTREF_PRIO_LOW runs every Nth pass (0/1: every pass)
+    uint32_t critical_boost;      // CARTREF_PRIO_CRITICAL runs get this many times the attempts per visit
+    uint32_t min_round_ms;        // with io->msec: a round lasts at least this long before skipping
 } CartRefParams;
 
 typedef enum {
@@ -172,6 +183,12 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
 // Current time share (0..1) of every read strategy, from the statistics in
 // list->dec (unusable or disabled strategies get 0).
 void CartRef_StrategyShares(const CartRefIo* io, const CartRefParams* p, const CartRefList* l, double* share);
+
+// Read every FIXED sector again (plain reads, no refresh) and put those that
+// no longer match back to PENDING. Returns how many relapsed; `checked` (may be
+// NULL) gets how many were read successfully.
+#define CARTREF_RECHECK_RUN 64u
+uint32_t CartRef_Recheck(const CartRefIo* io, CartRefList* l, uint32_t* checked);
 
 // Let the recent figures fade by `cost_units` (seconds, or k-attempts without a clock).
 void CartRef_DecayStrategies(CartRefList* l, double cost_units);

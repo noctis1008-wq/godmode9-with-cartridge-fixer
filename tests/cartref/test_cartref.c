@@ -304,6 +304,41 @@ static void test_red_console_shares(void) {
     free_mock(m);
 }
 
+static void test_priorities_and_recheck(void) {
+    Mock* m = new_mock();
+    m->fault[100] = NOISE; // critical (e.g. ExeFS)
+    m->fault[200] = NOISE; // normal
+    m->fault[300] = NOISE; // low (update partition)
+    CartRefIo io = io_for(m);
+    CartRefList l;
+    CartRef_ListInit(&l, 10);
+    CartRef_ListAdd(&l, 100); l.s[0].prio = CARTREF_PRIO_CRITICAL;
+    CartRef_ListAdd(&l, 200);
+    CartRef_ListAdd(&l, 300); l.s[2].prio = CARTREF_PRIO_LOW;
+    CartRefParams p;
+    CartRef_DefaultParams(&p);
+    p.strategies = 1; p.near_burst = 0; p.cold_every = 1;
+    p.retries_before_skip = 400; p.autoskip = true;
+    CHECK(CartRef_Repair(&io, &p, &l) == CARTREF_OK);
+    printf("priorities: critical %u, normal %u, low %u attempts\n", l.s[0].attempts, l.s[1].attempts, l.s[2].attempts);
+    CHECK(l.s[0].attempts >= 3 * l.s[1].attempts);
+    CHECK(l.s[2].attempts * 8 <= l.s[1].attempts);
+    // a reset keeps the priority
+    CartRef_ResetUnresolved(&l);
+    CHECK(l.s[0].prio == CARTREF_PRIO_CRITICAL && l.s[2].prio == CARTREF_PRIO_LOW);
+    // recheck: a fixed sector that went bad again goes back to the queue
+    CartRefList r;
+    CartRef_ListInit(&r, 10);
+    for (uint32_t k = 0; k < 5; k++) { CartRef_ListAdd(&r, 500 + k); r.s[k].state = CARTREF_FIXED; }
+    m->fault[502] = STUCK;
+    uint32_t checked = 0;
+    CHECK(CartRef_Recheck(&io, &r, &checked) == 1 && checked == 5);
+    CHECK(r.s[2].state == CARTREF_PENDING && r.s[1].state == CARTREF_FIXED);
+    CartRef_ListFree(&r);
+    CartRef_ListFree(&l);
+    free_mock(m);
+}
+
 static void test_noise_not_stuck(void) {
     // Data that keeps changing is never "stuck": only the retry limit ends it.
     Mock* m = new_mock();
@@ -438,6 +473,7 @@ int main(void) {
     test_strategies();
     test_adaptive();
     test_red_console_shares();
+    test_priorities_and_recheck();
     test_noise_not_stuck();
     test_read_errors();
     test_abort_and_resume();

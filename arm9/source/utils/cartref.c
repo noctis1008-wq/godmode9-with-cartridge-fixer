@@ -17,6 +17,9 @@ void CartRef_DefaultParams(CartRefParams* p) {
     p->cold_every = CARTREF_COLD_EVERY;
     p->near_burst = CARTREF_NEAR_BURST;
     p->strategies = CARTREF_STRATS_ALL;
+    p->low_every = 16;
+    p->critical_boost = 4;
+    p->min_round_ms = 5 * 60 * 1000;
 }
 
 bool CartRef_ListInit(CartRefList* l, uint32_t capacity) {
@@ -47,6 +50,7 @@ bool CartRef_ListAdd(CartRefList* l, uint32_t sector) {
     memset(e, 0, sizeof(*e));
     e->sector = sector;
     e->state = CARTREF_PENDING;
+    e->prio = CARTREF_PRIO_NORMAL;
     return true;
 }
 
@@ -68,9 +72,11 @@ uint32_t CartRef_ResetUnresolved(CartRefList* l) {
         CartRefSector* e = &l->s[i];
         if ((e->state != CARTREF_UNFIXABLE) && (e->state != CARTREF_SKIPPED)) continue;
         uint32_t sector = e->sector, near = e->near_miss;
+        uint8_t prio = e->prio;
         memset(e, 0, sizeof(*e));
         e->sector = sector;
         e->near_miss = near;
+        e->prio = prio;
         e->state = CARTREF_PENDING;
         n++;
     }
@@ -332,6 +338,7 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
     CartRefStatus st;
     memset(&st, 0, sizeof(st));
     st.phase = CARTREF_PHASE_REPAIR;
+    uint32_t round_t0 = io->msec ? io->msec(io->ctx) : 0;
 
     for (;;) {
         CartRef_Count(list, &st);
@@ -349,6 +356,16 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
         bool cold_pass = !any_hot || (p->cold_every <= 1) || ((st.pass % p->cold_every) == 1);
         /* round-relative attempt budget: the skip limit is reached by every sector at the same pass */
         bool at_limit = (uint64_t) st.pass * apv >= p->retries_before_skip;
+        /* ... but not before the round has lasted min_round_ms: very short rounds
+         * (e.g. 10 s with retries 500 and few sectors) only cost saving and logging */
+        if (at_limit && io->msec && p->min_round_ms &&
+            ((uint32_t) (io->msec(io->ctx) - round_t0) < p->min_round_ms))
+            at_limit = false;
+        /* sectors not needed to play only get every low_every-th pass while others wait */
+        bool any_wanted = false;
+        for (uint32_t j = 0; j < list->count; j++)
+            if ((list->s[j].state == CARTREF_PENDING) && (list->s[j].prio != CARTREF_PRIO_LOW)) { any_wanted = true; break; }
+        bool low_pass = !any_wanted || (p->low_every <= 1) || ((st.pass % p->low_every) == 1);
         /* time shares of the read strategies, updated once per pass */
         if (p->strategies & ~1u) {
             strat_dec_init(io, list);
@@ -375,6 +392,13 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
             uint32_t first = run[0].sector;
             bool hot = false;
             for (uint32_t k = 0; k < n; k++) hot |= (run[k].near_miss != 0);
+            uint8_t prio = CARTREF_PRIO_LOW;
+            for (uint32_t k = 0; k < n; k++) if (run[k].prio < prio) prio = run[k].prio;
+            if ((prio == CARTREF_PRIO_CRITICAL) && !at_limit) hot = true; /* always worked on */
+            if ((prio == CARTREF_PRIO_LOW) && !low_pass && !at_limit) {
+                i += n;
+                continue;
+            }
             if (!hot && !cold_pass && !at_limit) {
                 i += n;
                 continue;
@@ -384,6 +408,7 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
                 return CARTREF_ABORTED;
 
             uint32_t limit = apv;
+            if ((prio == CARTREF_PRIO_CRITICAL) && (p->critical_boost > 1)) limit = apv * p->critical_boost;
             int sticky = -1; /* after a near miss, the burst keeps the strategy that got it */
             for (uint32_t a = 0; a < limit; a++) {
                 uint32_t open = 0;
@@ -494,6 +519,41 @@ CartRefResult CartRef_Repair(const CartRefIo* io, const CartRefParams* p, CartRe
         CartRef_Count(list, &st);
         if (io->end_pass) io->end_pass(io->ctx, &st);
     }
+}
+
+uint32_t CartRef_Recheck(const CartRefIo* io, CartRefList* l, uint32_t* checked) {
+    static uint8_t buf[CARTREF_RECHECK_RUN * CARTREF_SECTOR];
+    uint8_t m[CARTREF_RECHECK_RUN];
+    uint32_t relapsed = 0, n_checked = 0;
+    uint32_t i = 0;
+    while (i < l->count) {
+        if (l->s[i].state != CARTREF_FIXED) {
+            i++;
+            continue;
+        }
+        uint32_t n = 1;
+        while ((n < CARTREF_RECHECK_RUN) && (i + n < l->count) && (l->s[i + n].state == CARTREF_FIXED) &&
+               (l->s[i + n].sector == l->s[i].sector + n))
+            n++;
+        uint32_t first = l->s[i].sector;
+        if ((io->cart_read(io->ctx, first, n, buf, false) == 0) &&
+            (io->ref_compare(io->ctx, first, n, buf, m) == 0)) {
+            for (uint32_t k = 0; k < n; k++) {
+                n_checked++;
+                if (m[k]) continue;
+                /* bad again: back into the queue, history (near misses) kept */
+                CartRefSector* e = &l->s[i + k];
+                e->state = CARTREF_PENDING;
+                e->attempts = 0;
+                e->stuck = 0;
+                e->last_sum = 0;
+                relapsed++;
+            }
+        }
+        i += n;
+    }
+    if (checked) *checked = n_checked;
+    return relapsed;
 }
 
 size_t CartRef_SaveState(const CartRefList* l, const CartRefResumeHeader* hdr, void* out, size_t out_size) {
